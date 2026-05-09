@@ -384,6 +384,32 @@ class ConfigManager {
 
 const configManager = new ConfigManager();
 
+const STATUS_KEY = "grok";
+
+type StatusContext = {
+	ui: { setStatus(key: string, text: string | undefined): void };
+};
+
+let nextStatusId = 0;
+const activeStatuses: Array<{ id: number; text: string }> = [];
+
+function formatGrokStatus(model: string): string {
+	return `Grok | ${model}`;
+}
+
+function beginStatus(ctx: StatusContext, text: string): () => void {
+	const id = ++nextStatusId;
+	activeStatuses.push({ id, text });
+	ctx.ui.setStatus(STATUS_KEY, text);
+
+	return () => {
+		const index = activeStatuses.findIndex((status) => status.id === id);
+		if (index >= 0) activeStatuses.splice(index, 1);
+		const latest = activeStatuses[activeStatuses.length - 1];
+		ctx.ui.setStatus(STATUS_KEY, latest?.text);
+	};
+}
+
 // =============================================================================
 // HTTP Utilities
 // =============================================================================
@@ -1462,11 +1488,12 @@ export default function (pi: ExtensionAPI) {
 			),
 		}),
 
-		async execute(_toolCallId, params, signal, onUpdate) {
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			const config = await configManager.getFullConfig();
+			const endStatus = beginStatus(ctx, formatGrokStatus(config.grokModel));
 			onUpdate?.({ content: [{ type: "text", text: "🔍 正在搜索..." }], details: {} });
 
 			try {
-				const config = await configManager.getFullConfig();
 				const sessionId = newSessionId();
 
 				// Parallel: Grok search + optional Tavily/Firecrawl
@@ -1537,6 +1564,8 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(
 					`搜索失败: ${e instanceof Error ? e.message : String(e)}`,
 				);
+			} finally {
+				endStatus();
 			}
 		},
 	});
@@ -1618,65 +1647,70 @@ export default function (pi: ExtensionAPI) {
 			url: Type.String({ description: "要抓取的网页 URL（HTTP/HTTPS）" }),
 		}),
 
-		async execute(_toolCallId, params, signal, onUpdate) {
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			const config = await configManager.getFullConfig();
+			const endStatus = beginStatus(ctx, formatGrokStatus(config.grokModel));
 			onUpdate?.({ content: [{ type: "text", text: "📄 正在抓取网页..." }], details: {} });
 
-			const config = await configManager.getFullConfig();
+			try {
 
-			// Try Tavily first
-			if (config.tavilyApiKey) {
-				const result = await tavilyExtract(params.url, signal);
-				if (result) {
-					const output = await truncateToolOutput(result, "web-fetch-tavily");
-					const { content, ...outputDetails } = output;
+				// Try Tavily first
+				if (config.tavilyApiKey) {
+					const result = await tavilyExtract(params.url, signal);
+					if (result) {
+						const output = await truncateToolOutput(result, "web-fetch-tavily");
+						const { content, ...outputDetails } = output;
+						return {
+							content: [{ type: "text", text: content }],
+							details: { url: params.url, provider: "tavily", ...outputDetails },
+						};
+					}
+				}
+
+				// Fallback to Firecrawl
+				if (config.firecrawlApiKey) {
+					onUpdate?.({
+						content: [
+							{ type: "text", text: "📄 Tavily 失败，尝试 Firecrawl..." },
+						],
+						details: {},
+					});
+					const result = await firecrawlScrape(params.url, signal);
+					if (result) {
+						const output = await truncateToolOutput(result, "web-fetch-firecrawl");
+						const { content, ...outputDetails } = output;
+						return {
+							content: [{ type: "text", text: content }],
+							details: { url: params.url, provider: "firecrawl", ...outputDetails },
+						};
+					}
+				}
+
+				// Both failed or not configured
+				if (!config.tavilyApiKey && !config.firecrawlApiKey) {
 					return {
-						content: [{ type: "text", text: content }],
-						details: { url: params.url, provider: "tavily", ...outputDetails },
+						content: [
+							{
+								type: "text",
+								text: "配置错误: TAVILY_API_KEY 和 FIRECRAWL_API_KEY 均未配置。\n请使用 /grok-config 设置至少一个。",
+							},
+						],
+						details: { url: params.url, error: "not_configured" },
 					};
 				}
-			}
 
-			// Fallback to Firecrawl
-			if (config.firecrawlApiKey) {
-				onUpdate?.({
-					content: [
-						{ type: "text", text: "📄 Tavily 失败，尝试 Firecrawl..." },
-					],
-					details: {},
-				});
-				const result = await firecrawlScrape(params.url, signal);
-				if (result) {
-					const output = await truncateToolOutput(result, "web-fetch-firecrawl");
-					const { content, ...outputDetails } = output;
-					return {
-						content: [{ type: "text", text: content }],
-						details: { url: params.url, provider: "firecrawl", ...outputDetails },
-					};
-				}
-			}
-
-			// Both failed or not configured
-			if (!config.tavilyApiKey && !config.firecrawlApiKey) {
 				return {
 					content: [
 						{
 							type: "text",
-							text: "配置错误: TAVILY_API_KEY 和 FIRECRAWL_API_KEY 均未配置。\n请使用 /grok-config 设置至少一个。",
+							text: "提取失败: 所有提取服务均未能获取内容。可尝试用 grok_search 搜索相关内容。",
 						},
 					],
-					details: { url: params.url, error: "not_configured" },
+					details: { url: params.url, error: "all_failed" },
 				};
+			} finally {
+				endStatus();
 			}
-
-			return {
-				content: [
-					{
-						type: "text",
-						text: "提取失败: 所有提取服务均未能获取内容。可尝试用 grok_search 搜索相关内容。",
-					},
-				],
-				details: { url: params.url, error: "all_failed" },
-			};
 		},
 	});
 
@@ -1717,22 +1751,28 @@ export default function (pi: ExtensionAPI) {
 			),
 		}),
 
-		async execute(_toolCallId, params, signal) {
-			const result = await tavilyMap(
-				params.url,
-				{
-					instructions: params.instructions,
-					maxDepth: params.max_depth,
-					maxBreadth: params.max_breadth,
-					limit: params.limit,
-					timeout: params.timeout,
-				},
-				signal,
-			);
-			return {
-				content: [{ type: "text", text: result }],
-				details: { url: params.url },
-			};
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const config = await configManager.getFullConfig();
+			const endStatus = beginStatus(ctx, formatGrokStatus(config.grokModel));
+			try {
+				const result = await tavilyMap(
+					params.url,
+					{
+						instructions: params.instructions,
+						maxDepth: params.max_depth,
+						maxBreadth: params.max_breadth,
+						limit: params.limit,
+						timeout: params.timeout,
+					},
+					signal,
+				);
+				return {
+					content: [{ type: "text", text: result }],
+					details: { url: params.url },
+				};
+			} finally {
+				endStatus();
+			}
 		},
 	});
 
@@ -2020,7 +2060,8 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			ctx.ui.setStatus("grok", "🔍 搜索中...");
+			const config = await configManager.getFullConfig();
+			const endStatus = beginStatus(ctx, formatGrokStatus(config.grokModel));
 
 			try {
 				const raw = await grokSearch(args.trim());
@@ -2051,7 +2092,7 @@ export default function (pi: ExtensionAPI) {
 					"error",
 				);
 			} finally {
-				ctx.ui.setStatus("grok", undefined);
+				endStatus();
 			}
 		},
 	});
@@ -2286,7 +2327,8 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const topic =
 				args.trim() || "pi Extension API registerTool registerCommand";
-			ctx.ui.setStatus("grok", "📚 搜索 pi 文档...");
+			const config = await configManager.getFullConfig();
+			const endStatus = beginStatus(ctx, formatGrokStatus(config.grokModel));
 
 			try {
 				const raw = await grokSearch(
@@ -2317,7 +2359,7 @@ export default function (pi: ExtensionAPI) {
 					"error",
 				);
 			} finally {
-				ctx.ui.setStatus("grok", undefined);
+				endStatus();
 			}
 		},
 	});
@@ -2343,19 +2385,10 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// =========================================================================
-	// Session Start: Show status
+	// Status bar stays hidden while idle; tools/commands show it only during work.
 	// =========================================================================
 	pi.on("session_start", async (_event, ctx) => {
-		const config = await configManager.getFullConfig();
-		const services: string[] = [];
-		if (config.grokApiUrl) services.push("Grok");
-		if (config.tavilyApiKey) services.push("Tavily");
-		if (config.firecrawlApiKey) services.push("Firecrawl");
-
-		if (services.length > 0) {
-			ctx.ui.setStatus("grok", `${services.join("+")} | ${config.grokModel}`);
-		} else {
-			ctx.ui.setStatus("grok", "Grok: 未配置 (/grok-config)");
-		}
+		activeStatuses.length = 0;
+		ctx.ui.setStatus(STATUS_KEY, undefined);
 	});
 }
