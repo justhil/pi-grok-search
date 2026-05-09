@@ -23,9 +23,9 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { appendFile, readFile, writeFile, mkdir } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join, dirname } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 
 // =============================================================================
 // Types
@@ -46,13 +46,6 @@ interface Source {
 	title?: string;
 	description?: string;
 	provider?: string;
-}
-
-interface SearchResult {
-	content: string;
-	sources: Source[];
-	sourcesCount: number;
-	sessionId: string;
 }
 
 interface PlanningSession {
@@ -273,7 +266,6 @@ const planningEngine = new PlanningEngine();
 
 class ConfigManager {
 	private configPath: string;
-	private configCache: GrokConfigFile | null = null;
 	private modelsCache: { key: string; models: string[] } | null = null;
 
 	constructor() {
@@ -301,7 +293,6 @@ class ConfigManager {
 	async saveFile(config: GrokConfigFile): Promise<void> {
 		await mkdir(dirname(this.configPath), { recursive: true });
 		await writeFile(this.configPath, JSON.stringify(config, null, 2), "utf-8");
-		this.configCache = null;
 		this.modelsCache = null;
 	}
 
@@ -315,10 +306,14 @@ class ConfigManager {
 		firecrawlApiKey: string;
 	}> {
 		const file = await this.loadFile();
+		const grokApiUrl = process.env.GROK_API_URL || file.apiUrl || "";
 		return {
-			grokApiUrl: process.env.GROK_API_URL || file.apiUrl || "",
+			grokApiUrl,
 			grokApiKey: process.env.GROK_API_KEY || file.apiKey || "",
-			grokModel: process.env.GROK_MODEL || file.model || "grok-4-fast",
+			grokModel: normalizeGrokModel(
+				process.env.GROK_MODEL || file.model || "grok-4-fast",
+				grokApiUrl,
+			),
 			tavilyApiUrl:
 				process.env.TAVILY_API_URL ||
 				file.tavilyApiUrl ||
@@ -384,6 +379,13 @@ class ConfigManager {
 
 const configManager = new ConfigManager();
 
+function normalizeGrokModel(model: string, apiUrl: string): string {
+	if (apiUrl.toLowerCase().includes("openrouter") && !model.includes(":online")) {
+		return `${model}:online`;
+	}
+	return model;
+}
+
 const STATUS_KEY = "grok";
 
 type StatusContext = {
@@ -417,6 +419,63 @@ function beginStatus(ctx: StatusContext, text: string): () => void {
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 const DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024;
 const DEFAULT_MAX_OUTPUT_LINES = 2000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
+
+function getDebugConfig(): { enabled: boolean; logDir: string; level: string } {
+	const enabled = ["true", "1", "yes", "on"].includes(
+		(process.env.GROK_DEBUG || "").toLowerCase(),
+	);
+	const configuredDir = process.env.GROK_LOG_DIR || join(homedir(), ".config", "pi-grok-search", "logs");
+	return {
+		enabled,
+		logDir: isAbsolute(configuredDir)
+			? configuredDir
+			: join(homedir(), ".config", "pi-grok-search", configuredDir),
+		level: (process.env.GROK_LOG_LEVEL || "info").toLowerCase(),
+	};
+}
+
+async function debugLog(event: string, details: Record<string, unknown> = {}): Promise<void> {
+	const config = getDebugConfig();
+	if (!config.enabled) return;
+	try {
+		await mkdir(config.logDir, { recursive: true });
+		const date = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+		const file = join(config.logDir, `pi-grok-search-${date}.log`);
+		const sanitized = sanitizeLogDetails(details);
+		await appendFile(
+			file,
+			`${new Date().toISOString()} ${config.level.toUpperCase()} ${event} ${JSON.stringify(sanitized)}\n`,
+			"utf8",
+		);
+	} catch {
+		// Never let debug logging affect tool execution.
+	}
+}
+
+function sanitizeLogDetails(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map((item) => sanitizeLogDetails(item));
+	if (!value || typeof value !== "object") return value;
+	const result: Record<string, unknown> = {};
+	for (const [key, entry] of Object.entries(value)) {
+		if (/key|token|secret|authorization/i.test(key)) {
+			result[key] = typeof entry === "string" ? maskSecret(entry) : "***";
+		} else {
+			result[key] = sanitizeLogDetails(entry);
+		}
+	}
+	return result;
+}
+
+function maskSecret(value: string): string {
+	if (!value) return "";
+	if (value.length <= 8) return "***";
+	return `${value.slice(0, 4)}${"*".repeat(value.length - 8)}${value.slice(-4)}`;
+}
+
+function createTimeoutSignal(timeoutMs: number, signal?: AbortSignal): AbortSignal | undefined {
+	return abortSignalAny([signal, AbortSignal.timeout(timeoutMs)]);
+}
 
 class HttpStatusError extends Error {
 	readonly status: number;
@@ -471,9 +530,11 @@ async function fetchWithRetry(
 ): Promise<Response> {
 	let lastError: Error | null = null;
 	const retryConfig = getRetryConfig();
+	const startedAt = Date.now();
 
 	for (let attempt = 0; attempt <= maxRetries; attempt++) {
 		try {
+			await debugLog("request.start", { url, attempt: attempt + 1, maxRetries });
 			const response = await fetch(url, init);
 
 			if (!response.ok) {
@@ -485,30 +546,55 @@ async function fetchWithRetry(
 						response.status === 429
 							? parseRetryAfterMs(response.headers.get("Retry-After"))
 							: null;
-					await sleep(
+					const waitMs =
 						retryAfterMs ??
-							exponentialBackoffMs(
-								attempt,
-								retryConfig.maxWaitMs,
-								retryConfig.multiplierMs,
-							),
-					);
+						exponentialBackoffMs(
+							attempt,
+							retryConfig.maxWaitMs,
+							retryConfig.multiplierMs,
+						);
+					await debugLog("request.retry", {
+						url,
+						attempt: attempt + 1,
+						status: response.status,
+						waitMs,
+					});
+					await sleep(waitMs);
 					continue;
 				}
+				await debugLog("request.error", { url, status: response.status, body: text.slice(0, 300) });
 				throw error;
 			}
 
+			await debugLog("request.success", {
+				url,
+				status: response.status,
+				attempt: attempt + 1,
+				elapsedMs: Date.now() - startedAt,
+			});
 			return response;
 		} catch (e) {
 			lastError = e instanceof Error ? e : new Error(String(e));
-			if (!isRetryableError(lastError) || attempt >= maxRetries) throw lastError;
-			await sleep(
-				exponentialBackoffMs(
-					attempt,
-					retryConfig.maxWaitMs,
-					retryConfig.multiplierMs,
-				),
+			if (!isRetryableError(lastError) || attempt >= maxRetries) {
+				await debugLog("request.failed", {
+					url,
+					attempt: attempt + 1,
+					error: lastError.message,
+				});
+				throw lastError;
+			}
+			const waitMs = exponentialBackoffMs(
+				attempt,
+				retryConfig.maxWaitMs,
+				retryConfig.multiplierMs,
 			);
+			await debugLog("request.retry", {
+				url,
+				attempt: attempt + 1,
+				error: lastError.message,
+				waitMs,
+			});
+			await sleep(waitMs);
 		}
 	}
 
@@ -1013,6 +1099,45 @@ function getSettledValue<T>(
 	return result?.status === "fulfilled" ? (result.value as T) : fallback;
 }
 
+async function fetchAvailableModels(
+	apiUrl: string,
+	apiKey: string,
+	signal?: AbortSignal,
+): Promise<string[]> {
+	if (!apiUrl || !apiKey) return [];
+	const response = await fetchWithRetry(
+		`${apiUrl.replace(/\/+$/, "")}/models`,
+		{
+			headers: { Authorization: `Bearer ${apiKey}` },
+			signal: createTimeoutSignal(10_000, signal),
+		},
+	);
+	const data = (await response.json()) as { data?: Array<{ id?: string }> };
+	return (data.data || [])
+		.map((model) => model.id)
+		.filter((id): id is string => typeof id === "string" && id.length > 0);
+}
+
+async function getAvailableModelsCached(
+	apiUrl: string,
+	apiKey: string,
+	signal?: AbortSignal,
+): Promise<string[]> {
+	const cached = configManager.getCachedModels(apiUrl, apiKey);
+	if (cached) return cached;
+	try {
+		const models = await fetchAvailableModels(apiUrl, apiKey, signal);
+		configManager.setCachedModels(apiUrl, apiKey, models);
+		return models;
+	} catch (e) {
+		await debugLog("models.fetch_failed", {
+			apiUrl,
+			error: e instanceof Error ? e.message : String(e),
+		});
+		return [];
+	}
+}
+
 // =============================================================================
 // Grok API Client
 // =============================================================================
@@ -1021,6 +1146,7 @@ async function grokSearch(
 	query: string,
 	platform = "",
 	signal?: AbortSignal,
+	modelOverride = "",
 ): Promise<string> {
 	const config = await configManager.getFullConfig();
 	if (!config.grokApiUrl || !config.grokApiKey) {
@@ -1031,46 +1157,18 @@ async function grokSearch(
 	const platformPrompt = platform
 		? `\n\nYou should search the web for the information you need, and focus on these platform: ${platform}\n`
 		: "";
+	const effectiveModel = normalizeGrokModel(modelOverride || config.grokModel, config.grokApiUrl);
+	await debugLog("grok.search", {
+		model: effectiveModel,
+		platform,
+		hasTimeContext: !!timeContext,
+	});
 
 	const payload = {
-		model: config.grokModel,
+		model: effectiveModel,
 		messages: [
 			{ role: "system", content: SEARCH_PROMPT },
 			{ role: "user", content: timeContext + query + platformPrompt },
-		],
-		stream: true,
-	};
-
-	const response = await fetchWithRetry(
-		`${config.grokApiUrl.replace(/\/+$/, "")}/chat/completions`,
-		{
-			method: "POST",
-			headers: {
-				Authorization: `Bearer ${config.grokApiKey}`,
-				"Content-Type": "application/json",
-			},
-			body: JSON.stringify(payload),
-			signal,
-		},
-	);
-
-	return parseStreamResponse(response);
-}
-
-async function grokFetch(url: string, signal?: AbortSignal): Promise<string> {
-	const config = await configManager.getFullConfig();
-	if (!config.grokApiUrl || !config.grokApiKey) {
-		throw new Error("Grok API 未配置。");
-	}
-
-	const payload = {
-		model: config.grokModel,
-		messages: [
-			{ role: "system", content: FETCH_PROMPT },
-			{
-				role: "user",
-				content: `${url}\n获取该网页内容并返回其结构化Markdown格式`,
-			},
 		],
 		stream: true,
 	};
@@ -1208,7 +1306,7 @@ async function tavilyExtract(
 	if (!config.tavilyApiKey) return null;
 
 	try {
-		const response = await fetch(
+		const response = await fetchWithRetry(
 			`${config.tavilyApiUrl.replace(/\/+$/, "")}/extract`,
 			{
 				method: "POST",
@@ -1217,19 +1315,20 @@ async function tavilyExtract(
 					"Content-Type": "application/json",
 				},
 				body: JSON.stringify({ urls: [url], format: "markdown" }),
-				signal,
+				signal: createTimeoutSignal(DEFAULT_REQUEST_TIMEOUT_MS, signal),
 			},
 		);
-
-		if (!response.ok) return null;
 
 		const data = (await response.json()) as {
 			results?: Array<{ raw_content?: string }>;
 		};
 
 		const content = data.results?.[0]?.raw_content;
+		await debugLog("tavily.extract", { url, success: !!content?.trim() });
 		return content?.trim() || null;
-	} catch {
+	} catch (e) {
+		if (e instanceof Error && e.name === "AbortError") throw e;
+		await debugLog("tavily.extract_failed", { url, error: e instanceof Error ? e.message : String(e) });
 		return null;
 	}
 }
@@ -1254,7 +1353,7 @@ async function tavilyMap(
 	const timeoutSignal = AbortSignal.timeout((timeout + 10) * 1000);
 
 	try {
-		const response = await fetch(
+		const response = await fetchWithRetry(
 			`${config.tavilyApiUrl.replace(/\/+$/, "")}/map`,
 			{
 				method: "POST",
@@ -1297,6 +1396,8 @@ async function tavilyMap(
 			2,
 		);
 	} catch (e) {
+		if (e instanceof Error && e.name === "AbortError") throw e;
+		await debugLog("tavily.map_failed", { url, error: e instanceof Error ? e.message : String(e) });
 		return `映射错误: ${e instanceof Error ? e.message : String(e)}`;
 	}
 }
@@ -1314,7 +1415,7 @@ async function firecrawlSearch(
 	if (!config.firecrawlApiKey) return [];
 
 	try {
-		const response = await fetch(
+		const response = await fetchWithRetry(
 			`${config.firecrawlApiUrl.replace(/\/+$/, "")}/search`,
 			{
 				method: "POST",
@@ -1323,11 +1424,9 @@ async function firecrawlSearch(
 					"Content-Type": "application/json",
 				},
 				body: JSON.stringify({ query, limit }),
-				signal,
+				signal: createTimeoutSignal(DEFAULT_REQUEST_TIMEOUT_MS, signal),
 			},
 		);
-
-		if (!response.ok) return [];
 
 		const data = (await response.json()) as {
 			data?: {
@@ -1341,7 +1440,9 @@ async function firecrawlSearch(
 			description: r.description || undefined,
 			provider: "firecrawl",
 		}));
-	} catch {
+	} catch (e) {
+		if (e instanceof Error && e.name === "AbortError") throw e;
+		await debugLog("firecrawl.search_failed", { error: e instanceof Error ? e.message : String(e) });
 		return [];
 	}
 }
@@ -1355,7 +1456,7 @@ async function firecrawlScrape(
 
 	for (let attempt = 0; attempt < 3; attempt++) {
 		try {
-			const response = await fetch(
+			const response = await fetchWithRetry(
 				`${config.firecrawlApiUrl.replace(/\/+$/, "")}/scrape`,
 				{
 					method: "POST",
@@ -1369,11 +1470,9 @@ async function firecrawlScrape(
 						timeout: 60000,
 						waitFor: (attempt + 1) * 1500,
 					}),
-					signal,
+					signal: createTimeoutSignal(DEFAULT_REQUEST_TIMEOUT_MS, signal),
 				},
 			);
-
-			if (!response.ok) return null;
 
 			const data = (await response.json()) as {
 				data?: { markdown?: string };
@@ -1381,8 +1480,14 @@ async function firecrawlScrape(
 
 			const md = data.data?.markdown;
 			if (md?.trim()) return md;
-		} catch {
-			return null;
+			await debugLog("firecrawl.scrape_empty", { url, attempt: attempt + 1 });
+		} catch (e) {
+			if (e instanceof Error && e.name === "AbortError") throw e;
+			await debugLog("firecrawl.scrape_failed", {
+				url,
+				attempt: attempt + 1,
+				error: e instanceof Error ? e.message : String(e),
+			});
 		}
 	}
 
@@ -1392,6 +1497,22 @@ async function firecrawlScrape(
 // =============================================================================
 // Prompts
 // =============================================================================
+
+const grokConfigParameters = Type.Object({
+	action: StringEnum(["show", "set", "test"] as const),
+	key: Type.Optional(
+		StringEnum([
+			"grokApiUrl",
+			"grokApiKey",
+			"model",
+			"tavilyApiKey",
+			"tavilyApiUrl",
+			"firecrawlApiKey",
+			"firecrawlApiUrl",
+		] as const),
+	),
+	value: Type.Optional(Type.String()),
+});
 
 const SEARCH_PROMPT = `# Core Instruction
 
@@ -1417,16 +1538,6 @@ const SEARCH_PROMPT = `# Core Instruction
 2. **Define every technical term** in plain language.
 3. **Every sentence must cite sources** (URLs). Silence if uncited.
 4. **Strictly format outputs in polished Markdown**.
-`;
-
-const FETCH_PROMPT = `You are a professional web content fetcher. Given a URL, fetch its content and return a structured Markdown document.
-
-Rules:
-- Preserve the original content structure (headings, lists, tables, code blocks)
-- Convert HTML to clean Markdown
-- Do NOT summarize or modify the content
-- Return the complete content as-is
-- Use proper Markdown formatting: # for headings, **bold**, *italic*, \`code\`, etc.
 `;
 
 // =============================================================================
@@ -1486,11 +1597,17 @@ export default function (pi: ExtensionAPI) {
 					maximum: 50,
 				}),
 			),
+			model: Type.Optional(
+				Type.String({
+					description: "可选模型 ID，仅本次请求生效。留空使用全局配置模型。",
+				}),
+			),
 		}),
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const config = await configManager.getFullConfig();
-			const endStatus = beginStatus(ctx, formatGrokStatus(config.grokModel));
+			const effectiveModel = normalizeGrokModel(params.model || config.grokModel, config.grokApiUrl);
+			const endStatus = beginStatus(ctx, formatGrokStatus(effectiveModel));
 			onUpdate?.({ content: [{ type: "text", text: "🔍 正在搜索..." }], details: {} });
 
 			try {
@@ -1501,8 +1618,19 @@ export default function (pi: ExtensionAPI) {
 				const hasFirecrawl = !!config.firecrawlApiKey;
 				const extraCount = params.extra_sources || 0;
 
+				if (params.model && config.grokApiUrl && config.grokApiKey) {
+					const models = await getAvailableModelsCached(
+						config.grokApiUrl,
+						config.grokApiKey,
+						signal,
+					);
+					if (models.length > 0 && !models.includes(effectiveModel)) {
+						throw new Error(`无效模型: ${effectiveModel}`);
+					}
+				}
+
 				const tasks: Promise<unknown>[] = [
-					grokSearch(params.query, params.platform || "", signal),
+					grokSearch(params.query, params.platform || "", signal, effectiveModel),
 				];
 
 				if (extraCount > 0 && hasTavily) {
@@ -1515,6 +1643,13 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				const results = await Promise.allSettled(tasks);
+
+				if (results[0]?.status === "rejected") {
+					if (results.length === 1) throw results[0].reason;
+					await debugLog("grok.search_primary_failed", {
+						error: results[0].reason instanceof Error ? results[0].reason.message : String(results[0].reason),
+					});
+				}
 
 				const grokResult = getSettledValue<string>(results[0], "");
 				let resultIndex = 1;
@@ -1541,6 +1676,9 @@ export default function (pi: ExtensionAPI) {
 
 				// Build output
 				let output = answer;
+				if (!grokResult && allSources.length > 0) {
+					output = "⚠️ Grok 主搜索失败，仅返回补充信源。";
+				}
 				if (allSources.length > 0) {
 					output += `\n\n---\n**信源 (${allSources.length})** | session_id: \`${sessionId}\`\n`;
 					for (const s of allSources.slice(0, 10)) {
@@ -1551,13 +1689,17 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 
+				const finalOutput = await truncateToolOutput(output, "grok-search");
+				const { content, ...outputDetails } = finalOutput;
 				return {
-					content: [{ type: "text", text: output }],
+					content: [{ type: "text", text: content }],
 					details: {
 						session_id: sessionId,
 						content: answer,
 						sources_count: allSources.length,
 						sources: allSources,
+						model: effectiveModel,
+						...outputDetails,
 					},
 				};
 			} catch (e) {
@@ -1779,27 +1921,13 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 	// Tool: grok_config — 配置管理
 	// =========================================================================
-	pi.registerTool({
+	pi.registerTool<typeof grokConfigParameters, Record<string, unknown>>({
 		name: "grok_config",
 		label: "Grok Config",
 		description:
 			"查看或修改 Grok Search 的完整配置（Grok/Tavily/Firecrawl API）。",
 		promptSnippet: "查看或修改 Grok Search 配置",
-		parameters: Type.Object({
-			action: StringEnum(["show", "set", "test"] as const),
-			key: Type.Optional(
-				StringEnum([
-					"grokApiUrl",
-					"grokApiKey",
-					"model",
-					"tavilyApiKey",
-					"tavilyApiUrl",
-					"firecrawlApiKey",
-					"firecrawlApiUrl",
-				] as const),
-			),
-			value: Type.Optional(Type.String()),
-		}),
+		parameters: grokConfigParameters,
 
 		async execute(_toolCallId, params) {
 			const config = await configManager.getFullConfig();
@@ -1832,34 +1960,15 @@ export default function (pi: ExtensionAPI) {
 				if (config.grokApiUrl && config.grokApiKey) {
 					try {
 						const start = Date.now();
-						const response = await fetch(
-							`${config.grokApiUrl.replace(/\/+$/, "")}/models`,
-							{
-								headers: { Authorization: `Bearer ${config.grokApiKey}` },
-								signal: AbortSignal.timeout(10000),
-							},
-						);
+						const models = await getAvailableModelsCached(config.grokApiUrl, config.grokApiKey);
 						const elapsed = Date.now() - start;
-						if (response.ok) {
-							const data = (await response.json()) as {
-								data?: Array<{ id: string }>;
-							};
-							const models = (data.data || []).map((m) => m.id);
-							configManager.setCachedModels(
-								config.grokApiUrl,
-								config.grokApiKey,
-								models,
-							);
+						results.push(
+							`✅ **Grok API**: 连接成功 (${elapsed}ms)，${models.length} 个模型`,
+						);
+						if (models.length > 0) {
 							results.push(
-								`✅ **Grok API**: 连接成功 (${elapsed}ms)，${models.length} 个模型`,
+								`   模型: ${models.slice(0, 10).join(", ")}${models.length > 10 ? "..." : ""}`,
 							);
-							if (models.length > 0) {
-								results.push(
-									`   模型: ${models.slice(0, 10).join(", ")}${models.length > 10 ? "..." : ""}`,
-								);
-							}
-						} else {
-							results.push(`⚠️ **Grok API**: HTTP ${response.status}`);
 						}
 					} catch (e) {
 						results.push(
@@ -1873,25 +1982,10 @@ export default function (pi: ExtensionAPI) {
 				// Test Tavily
 				if (config.tavilyApiKey) {
 					try {
-						const response = await fetch(
-							`${config.tavilyApiUrl.replace(/\/+$/, "")}/search`,
-							{
-								method: "POST",
-								headers: {
-									Authorization: `Bearer ${config.tavilyApiKey}`,
-									"Content-Type": "application/json",
-								},
-								body: JSON.stringify({ query: "test", max_results: 1 }),
-								signal: AbortSignal.timeout(10000),
-							},
-						);
-						results.push(
-							response.ok
-								? "✅ **Tavily API**: 连接成功"
-								: `⚠️ **Tavily API**: HTTP ${response.status}`,
-						);
-					} catch {
-						results.push("❌ **Tavily API**: 连接失败");
+						await tavilySearch("test", 1);
+						results.push("✅ **Tavily API**: 连接成功");
+					} catch (e) {
+						results.push(`❌ **Tavily API**: ${e instanceof Error ? e.message : "连接失败"}`);
 					}
 				} else {
 					results.push("⏭️ **Tavily API**: 未配置");
@@ -1900,28 +1994,10 @@ export default function (pi: ExtensionAPI) {
 				// Test Firecrawl
 				if (config.firecrawlApiKey) {
 					try {
-						const response = await fetch(
-							`${config.firecrawlApiUrl.replace(/\/+$/, "")}/scrape`,
-							{
-								method: "POST",
-								headers: {
-									Authorization: `Bearer ${config.firecrawlApiKey}`,
-									"Content-Type": "application/json",
-								},
-								body: JSON.stringify({
-									url: "https://example.com",
-									formats: ["markdown"],
-								}),
-								signal: AbortSignal.timeout(15000),
-							},
-						);
-						results.push(
-							response.ok
-								? "✅ **Firecrawl API**: 连接成功"
-								: `⚠️ **Firecrawl API**: HTTP ${response.status}`,
-						);
-					} catch {
-						results.push("❌ **Firecrawl API**: 连接失败");
+						await firecrawlScrape("https://example.com");
+						results.push("✅ **Firecrawl API**: 连接成功");
+					} catch (e) {
+						results.push(`❌ **Firecrawl API**: ${e instanceof Error ? e.message : "连接失败"}`);
 					}
 				} else {
 					results.push("⏭️ **Firecrawl API**: 未配置");
@@ -2050,6 +2126,249 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// =========================================================================
+	// Strongly typed planning tools — wrappers around search_planning.
+	// =========================================================================
+	pi.registerTool({
+		name: "plan_intent",
+		label: "Plan Intent",
+		description:
+			"Phase 1 of search planning: analyze user intent. Call this first to create a planning session.",
+		promptSnippet: "Phase 1 search planning: analyze intent and create a session",
+		promptGuidelines: [
+			"Use plan_intent first when planning complex searches; pass its session_id to later planning tools.",
+		],
+		parameters: Type.Object({
+			thought: Type.String({ description: "Reasoning for this phase" }),
+			core_question: Type.String({ description: "Distilled core question in one sentence" }),
+			query_type: StringEnum(["factual", "comparative", "exploratory", "analytical"] as const),
+			time_sensitivity: StringEnum(["realtime", "recent", "historical", "irrelevant"] as const),
+			session_id: Type.Optional(Type.String({ description: "Empty for new session, or existing ID to revise" })),
+			confidence: Type.Optional(Type.Number({ description: "Confidence 0.0-1.0", minimum: 0, maximum: 1 })),
+			domain: Type.Optional(Type.String({ description: "Specific domain if identifiable" })),
+			premise_valid: Type.Optional(Type.Boolean({ description: "False if the question contains a flawed assumption" })),
+			ambiguities: Type.Optional(Type.Array(Type.String(), { description: "Unresolved ambiguities" })),
+			unverified_terms: Type.Optional(Type.Array(Type.String(), { description: "External terms/taxonomies to verify" })),
+			is_revision: Type.Optional(Type.Boolean({ description: "True to overwrite existing intent" })),
+		}),
+		async execute(_toolCallId, params) {
+			const phaseData: Record<string, unknown> = {
+				core_question: params.core_question,
+				query_type: params.query_type,
+				time_sensitivity: params.time_sensitivity,
+			};
+			if (params.domain) phaseData.domain = params.domain;
+			if (params.premise_valid !== undefined) phaseData.premise_valid = params.premise_valid;
+			if (params.ambiguities) phaseData.ambiguities = params.ambiguities;
+			if (params.unverified_terms) phaseData.unverified_terms = params.unverified_terms;
+			const result = planningEngine.processPhase({
+				phase: "intent_analysis",
+				thought: params.thought,
+				sessionId: params.session_id,
+				isRevision: params.is_revision,
+				confidence: params.confidence,
+				phaseData,
+			});
+			return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], details: result };
+		},
+	});
+
+	pi.registerTool({
+		name: "plan_complexity",
+		label: "Plan Complexity",
+		description: "Phase 2: assess search complexity from 1 to 3 and determine required phases.",
+		promptSnippet: "Phase 2 search planning: assess complexity",
+		parameters: Type.Object({
+			session_id: Type.String({ description: "Session ID from plan_intent" }),
+			thought: Type.String({ description: "Reasoning for complexity assessment" }),
+			level: Type.Number({ description: "Complexity 1-3", minimum: 1, maximum: 3 }),
+			estimated_sub_queries: Type.Number({ description: "Expected number of sub-queries", minimum: 1, maximum: 20 }),
+			estimated_tool_calls: Type.Number({ description: "Expected total tool calls", minimum: 1, maximum: 50 }),
+			justification: Type.String({ description: "Why this complexity level" }),
+			confidence: Type.Optional(Type.Number({ description: "Confidence 0.0-1.0", minimum: 0, maximum: 1 })),
+			is_revision: Type.Optional(Type.Boolean({ description: "True to overwrite" })),
+		}),
+		async execute(_toolCallId, params) {
+			if (!planningEngine.getSession(params.session_id)) {
+				const error = { error: `Session '${params.session_id}' not found. Call plan_intent first.` };
+				return { content: [{ type: "text", text: JSON.stringify(error, null, 2) }], details: error };
+			}
+			const result = planningEngine.processPhase({
+				phase: "complexity_assessment",
+				thought: params.thought,
+				sessionId: params.session_id,
+				isRevision: params.is_revision,
+				confidence: params.confidence,
+				phaseData: {
+					level: params.level,
+					estimated_sub_queries: params.estimated_sub_queries,
+					estimated_tool_calls: params.estimated_tool_calls,
+					justification: params.justification,
+				},
+			});
+			return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], details: result };
+		},
+	});
+
+	pi.registerTool({
+		name: "plan_sub_query",
+		label: "Plan Sub-query",
+		description: "Phase 3: add one sub-query. Call once per sub-query; data accumulates.",
+		promptSnippet: "Phase 3 search planning: add a sub-query",
+		parameters: Type.Object({
+			session_id: Type.String({ description: "Session ID from plan_intent" }),
+			thought: Type.String({ description: "Reasoning for this sub-query" }),
+			id: Type.String({ description: "Unique ID, e.g. sq1" }),
+			goal: Type.String({ description: "Sub-query goal" }),
+			expected_output: Type.String({ description: "What success looks like" }),
+			boundary: Type.String({ description: "What this excludes; should be mutually exclusive with siblings" }),
+			confidence: Type.Optional(Type.Number({ description: "Confidence 0.0-1.0", minimum: 0, maximum: 1 })),
+			depends_on: Type.Optional(Type.Array(Type.String(), { description: "Prerequisite sub-query IDs" })),
+			tool_hint: Type.Optional(StringEnum(["grok_search", "web_fetch", "web_map"] as const)),
+			is_revision: Type.Optional(Type.Boolean({ description: "True to replace all sub-queries" })),
+		}),
+		async execute(_toolCallId, params) {
+			if (!planningEngine.getSession(params.session_id)) {
+				const error = { error: `Session '${params.session_id}' not found. Call plan_intent first.` };
+				return { content: [{ type: "text", text: JSON.stringify(error, null, 2) }], details: error };
+			}
+			const phaseData: Record<string, unknown> = {
+				id: params.id,
+				goal: params.goal,
+				expected_output: params.expected_output,
+				boundary: params.boundary,
+			};
+			if (params.depends_on) phaseData.depends_on = params.depends_on;
+			if (params.tool_hint) phaseData.tool_hint = params.tool_hint;
+			const result = planningEngine.processPhase({
+				phase: "query_decomposition",
+				thought: params.thought,
+				sessionId: params.session_id,
+				isRevision: params.is_revision,
+				confidence: params.confidence,
+				phaseData,
+			});
+			return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], details: result };
+		},
+	});
+
+	pi.registerTool({
+		name: "plan_search_term",
+		label: "Plan Search Term",
+		description: "Phase 4: add one search term. Call once per term; data accumulates.",
+		promptSnippet: "Phase 4 search planning: add a search term",
+		parameters: Type.Object({
+			session_id: Type.String({ description: "Session ID from plan_intent" }),
+			thought: Type.String({ description: "Reasoning for this search term" }),
+			term: Type.String({ description: "Search query, ideally <= 8 words" }),
+			purpose: Type.String({ description: "Sub-query ID this term serves" }),
+			round: Type.Number({ description: "Execution round", minimum: 1 }),
+			confidence: Type.Optional(Type.Number({ description: "Confidence 0.0-1.0", minimum: 0, maximum: 1 })),
+			approach: Type.Optional(StringEnum(["broad_first", "narrow_first", "targeted"] as const)),
+			fallback_plan: Type.Optional(Type.String({ description: "Fallback if primary searches fail" })),
+			is_revision: Type.Optional(Type.Boolean({ description: "True to replace all search terms" })),
+		}),
+		async execute(_toolCallId, params) {
+			if (!planningEngine.getSession(params.session_id)) {
+				const error = { error: `Session '${params.session_id}' not found. Call plan_intent first.` };
+				return { content: [{ type: "text", text: JSON.stringify(error, null, 2) }], details: error };
+			}
+			const phaseData: Record<string, unknown> = {
+				search_terms: [{ term: params.term, purpose: params.purpose, round: params.round }],
+			};
+			if (params.approach) phaseData.approach = params.approach;
+			if (params.fallback_plan) phaseData.fallback_plan = params.fallback_plan;
+			const result = planningEngine.processPhase({
+				phase: "search_strategy",
+				thought: params.thought,
+				sessionId: params.session_id,
+				isRevision: params.is_revision,
+				confidence: params.confidence,
+				phaseData,
+			});
+			return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], details: result };
+		},
+	});
+
+	pi.registerTool({
+		name: "plan_tool_mapping",
+		label: "Plan Tool Mapping",
+		description: "Phase 5: map a sub-query to a tool. Call once per mapping; data accumulates.",
+		promptSnippet: "Phase 5 search planning: map sub-query to tool",
+		parameters: Type.Object({
+			session_id: Type.String({ description: "Session ID from plan_intent" }),
+			thought: Type.String({ description: "Reasoning for this mapping" }),
+			sub_query_id: Type.String({ description: "Sub-query ID to map" }),
+			tool: StringEnum(["grok_search", "web_fetch", "web_map"] as const),
+			reason: Type.String({ description: "Why this tool for this sub-query" }),
+			confidence: Type.Optional(Type.Number({ description: "Confidence 0.0-1.0", minimum: 0, maximum: 1 })),
+			params_json: Type.Optional(Type.String({ description: "Optional JSON string for tool-specific params" })),
+			is_revision: Type.Optional(Type.Boolean({ description: "True to replace all mappings" })),
+		}),
+		async execute(_toolCallId, params) {
+			if (!planningEngine.getSession(params.session_id)) {
+				const error = { error: `Session '${params.session_id}' not found. Call plan_intent first.` };
+				return { content: [{ type: "text", text: JSON.stringify(error, null, 2) }], details: error };
+			}
+			const phaseData: Record<string, unknown> = {
+				sub_query_id: params.sub_query_id,
+				tool: params.tool,
+				reason: params.reason,
+			};
+			if (params.params_json) {
+				try {
+					phaseData.params = JSON.parse(params.params_json);
+				} catch {
+					phaseData.params_raw = params.params_json;
+				}
+			}
+			const result = planningEngine.processPhase({
+				phase: "tool_selection",
+				thought: params.thought,
+				sessionId: params.session_id,
+				isRevision: params.is_revision,
+				confidence: params.confidence,
+				phaseData,
+			});
+			return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], details: result };
+		},
+	});
+
+	pi.registerTool({
+		name: "plan_execution",
+		label: "Plan Execution",
+		description: "Phase 6: define execution order for sub-queries.",
+		promptSnippet: "Phase 6 search planning: define execution order",
+		parameters: Type.Object({
+			session_id: Type.String({ description: "Session ID from plan_intent" }),
+			thought: Type.String({ description: "Reasoning for execution order" }),
+			parallel: Type.Optional(Type.Array(Type.Array(Type.String()), { description: "Groups of sub-query IDs runnable in parallel" })),
+			sequential: Type.Optional(Type.Array(Type.String(), { description: "Sub-query IDs that must run in order" })),
+			estimated_rounds: Type.Number({ description: "Estimated execution rounds", minimum: 1 }),
+			confidence: Type.Optional(Type.Number({ description: "Confidence 0.0-1.0", minimum: 0, maximum: 1 })),
+			is_revision: Type.Optional(Type.Boolean({ description: "True to overwrite" })),
+		}),
+		async execute(_toolCallId, params) {
+			if (!planningEngine.getSession(params.session_id)) {
+				const error = { error: `Session '${params.session_id}' not found. Call plan_intent first.` };
+				return { content: [{ type: "text", text: JSON.stringify(error, null, 2) }], details: error };
+			}
+			const result = planningEngine.processPhase({
+				phase: "execution_order",
+				thought: params.thought,
+				sessionId: params.session_id,
+				isRevision: params.is_revision,
+				confidence: params.confidence,
+				phaseData: {
+					parallel: params.parallel || [],
+					sequential: params.sequential || [],
+					estimated_rounds: params.estimated_rounds,
+				},
+			});
+			return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], details: result };
+		},
+	});
+
+	// =========================================================================
 	// Command: /grok-search
 	// =========================================================================
 	pi.registerCommand("grok-search", {
@@ -2135,9 +2454,8 @@ export default function (pi: ExtensionAPI) {
 					if (!url) return;
 					const key = await ctx.ui.input("Grok API Key:", "");
 					if (!key) return;
-					const file = await configManager.loadFile();
 					await configManager.setGrokApi(url, key);
-					ctx.ui.notify(`✅ Grok API 已配置`, "success");
+					ctx.ui.notify(`✅ Grok API 已配置`, "info");
 					break;
 				}
 
@@ -2145,7 +2463,7 @@ export default function (pi: ExtensionAPI) {
 					const key = await ctx.ui.input("Tavily API Key:", "");
 					if (!key) return;
 					await configManager.setTavily(key);
-					ctx.ui.notify(`✅ Tavily API 已配置`, "success");
+					ctx.ui.notify(`✅ Tavily API 已配置`, "info");
 					break;
 				}
 
@@ -2153,59 +2471,32 @@ export default function (pi: ExtensionAPI) {
 					const key = await ctx.ui.input("Firecrawl API Key:", "");
 					if (!key) return;
 					await configManager.setFirecrawl(key);
-					ctx.ui.notify(`✅ Firecrawl API 已配置`, "success");
+					ctx.ui.notify(`✅ Firecrawl API 已配置`, "info");
 					break;
 				}
 
 				case "切换模型": {
 					const config = await configManager.getFullConfig();
 					ctx.ui.notify("正在获取可用模型...", "info");
-
-					// Try cached first
-					let models = configManager.getCachedModels(
+					const models = await getAvailableModelsCached(
 						config.grokApiUrl,
 						config.grokApiKey,
 					);
 
-					if (!models && config.grokApiUrl && config.grokApiKey) {
-						try {
-							const response = await fetch(
-								`${config.grokApiUrl.replace(/\/+$/, "")}/models`,
-								{
-									headers: { Authorization: `Bearer ${config.grokApiKey}` },
-									signal: AbortSignal.timeout(10000),
-								},
-							);
-							if (response.ok) {
-								const data = (await response.json()) as {
-									data?: Array<{ id: string }>;
-								};
-								models = (data.data || []).map((m) => m.id);
-								configManager.setCachedModels(
-									config.grokApiUrl,
-									config.grokApiKey,
-									models,
-								);
-							}
-						} catch {
-							// ignore
-						}
-					}
-
-					if (models && models.length > 0) {
+					if (models.length > 0) {
 						const choice = await ctx.ui.select(
 							`当前: ${config.grokModel}`,
 							models,
 						);
 						if (choice) {
 							await configManager.setModel(choice);
-							ctx.ui.notify(`✅ 模型已切换: ${choice}`, "success");
+							ctx.ui.notify(`✅ 模型已切换: ${choice}`, "info");
 						}
 					} else {
 						const model = await ctx.ui.input("输入模型 ID:", config.grokModel);
 						if (model) {
 							await configManager.setModel(model);
-							ctx.ui.notify(`✅ 模型已切换: ${model}`, "success");
+							ctx.ui.notify(`✅ 模型已切换: ${model}`, "info");
 						}
 					}
 					break;
@@ -2219,23 +2510,12 @@ export default function (pi: ExtensionAPI) {
 					if (config.grokApiUrl && config.grokApiKey) {
 						try {
 							const start = Date.now();
-							const response = await fetch(
-								`${config.grokApiUrl.replace(/\/+$/, "")}/models`,
-								{
-									headers: { Authorization: `Bearer ${config.grokApiKey}` },
-									signal: AbortSignal.timeout(10000),
-								},
+							const models = await getAvailableModelsCached(
+								config.grokApiUrl,
+								config.grokApiKey,
 							);
 							const elapsed = Date.now() - start;
-							if (response.ok) {
-								const data = (await response.json()) as {
-									data?: Array<{ id: string }>;
-								};
-								const count = (data.data || []).length;
-								results.push(`✅ Grok: ${elapsed}ms, ${count} 模型`);
-							} else {
-								results.push(`⚠️ Grok: HTTP ${response.status}`);
-							}
+							results.push(`✅ Grok: ${elapsed}ms, ${models.length} 模型`);
 						} catch {
 							results.push("❌ Grok: 连接失败");
 						}
@@ -2267,53 +2547,28 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			if (args.trim()) {
 				await configManager.setModel(args.trim());
-				ctx.ui.notify(`✅ 模型已切换: ${args.trim()}`, "success");
+				ctx.ui.notify(`✅ 模型已切换: ${args.trim()}`, "info");
 				return;
 			}
 
 			const config = await configManager.getFullConfig();
-			let models = configManager.getCachedModels(
+			ctx.ui.notify("正在获取可用模型...", "info");
+			const models = await getAvailableModelsCached(
 				config.grokApiUrl,
 				config.grokApiKey,
 			);
 
-			if (!models && config.grokApiUrl && config.grokApiKey) {
-				ctx.ui.notify("正在获取可用模型...", "info");
-				try {
-					const response = await fetch(
-						`${config.grokApiUrl.replace(/\/+$/, "")}/models`,
-						{
-							headers: { Authorization: `Bearer ${config.grokApiKey}` },
-							signal: AbortSignal.timeout(10000),
-						},
-					);
-					if (response.ok) {
-						const data = (await response.json()) as {
-							data?: Array<{ id: string }>;
-						};
-						models = (data.data || []).map((m) => m.id);
-						configManager.setCachedModels(
-							config.grokApiUrl,
-							config.grokApiKey,
-							models,
-						);
-					}
-				} catch {
-					// ignore
-				}
-			}
-
-			if (models && models.length > 0) {
+			if (models.length > 0) {
 				const choice = await ctx.ui.select(`当前: ${config.grokModel}`, models);
 				if (choice) {
 					await configManager.setModel(choice);
-					ctx.ui.notify(`✅ 模型已切换: ${choice}`, "success");
+					ctx.ui.notify(`✅ 模型已切换: ${choice}`, "info");
 				}
 			} else {
 				const model = await ctx.ui.input("输入模型 ID:", config.grokModel);
 				if (model) {
 					await configManager.setModel(model);
-					ctx.ui.notify(`✅ 模型已切换: ${model}`, "success");
+					ctx.ui.notify(`✅ 模型已切换: ${model}`, "info");
 				}
 			}
 		},
@@ -2369,12 +2624,13 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 	pi.registerMessageRenderer("grok-search", (message, options, theme) => {
 		const { expanded } = options;
+		const details = message.details as { sources?: Source[] } | undefined;
 		let text = theme.fg("accent", "🔍 Grok Search\n\n");
 		text += message.content;
 
-		if (expanded && message.details?.sources?.length) {
+		if (expanded && details?.sources?.length) {
 			text += "\n\n" + theme.fg("muted", "─── 信源 ───\n");
-			for (const s of message.details.sources) {
+			for (const s of details.sources) {
 				const label = s.title || s.url;
 				const provider = s.provider ? ` [${s.provider}]` : "";
 				text += theme.fg("dim", `• ${label}${provider}\n`);
