@@ -1,0 +1,27 @@
+{
+  "name": "pi-grok-search",
+  "version": "2.0.0",
+  "description": "Grok Search Extension for pi - 双引擎架构：Grok AI 搜索 + Tavily 抓取 + Firecrawl 托底",
+  "keywords": ["pi-package", "pi-extension", "grok", "search", "tavily", "firecrawl"],
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/你的用户名/pi-grok-search.git"
+  },
+  "pi": {
+    "extensions": ["./index.ts"],
+    "image": "https://raw.githubusercontent.com/你的用户名/pi-grok-search/main/screenshot.png"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "scripts": {
+    "clean": "echo 'nothing to clean'",
+    "build": "echo 'nothing to build'"
+  },
+  "dependencies": {}
+}
