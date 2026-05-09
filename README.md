@@ -135,6 +135,7 @@ export FIRECRAWL_API_KEY="fc-your-key"
 
 ## 相关链接
 
+- [linux do](https://linux.do)
 - [本项目 GitHub](https://github.com/justhiL/pi-grok-search)
 - [pi 官方文档](https://github.com/earendil-works/pi-mono)
 - [pi Extension 文档](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/docs/extensions.md)
