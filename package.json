@@ -7,11 +7,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/你的用户名/pi-grok-search.git"
+    "url": "https://github.com/justhiL/pi-grok-search.git"
   },
   "pi": {
     "extensions": ["./index.ts"],
-    "image": "https://raw.githubusercontent.com/你的用户名/pi-grok-search/main/screenshot.png"
+    "image": "https://raw.githubusercontent.com/justhiL/pi-grok-search/main/screenshot.png"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
