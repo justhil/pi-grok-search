@@ -24,7 +24,7 @@ import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 
 // =============================================================================
@@ -389,47 +389,100 @@ const configManager = new ConfigManager();
 // =============================================================================
 
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
+const DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024;
+const DEFAULT_MAX_OUTPUT_LINES = 2000;
+
+class HttpStatusError extends Error {
+	readonly status: number;
+	readonly body: string;
+
+	constructor(status: number, body: string) {
+		super(`HTTP ${status}: ${body.slice(0, 300)}`);
+		this.name = "HttpStatusError";
+		this.status = status;
+		this.body = body;
+	}
+}
+
+function getRetryConfig(): { maxRetries: number; maxWaitMs: number; multiplierMs: number } {
+	const attempts = Number(process.env.GROK_RETRY_MAX_ATTEMPTS || "3");
+	const maxWait = Number(process.env.GROK_RETRY_MAX_WAIT || "10");
+	const multiplier = Number(process.env.GROK_RETRY_MULTIPLIER || "1");
+	return {
+		maxRetries: Number.isFinite(attempts) && attempts > 0 ? Math.floor(attempts) : 3,
+		maxWaitMs: (Number.isFinite(maxWait) && maxWait > 0 ? maxWait : 10) * 1000,
+		multiplierMs: (Number.isFinite(multiplier) && multiplier > 0 ? multiplier : 1) * 1000,
+	};
+}
+
+function parseRetryAfterMs(value: string | null): number | null {
+	if (!value) return null;
+	const trimmed = value.trim();
+	if (!trimmed) return null;
+	if (/^\d+(?:\.\d+)?$/.test(trimmed)) {
+		return Math.max(0, Number(trimmed) * 1000);
+	}
+	const dateMs = Date.parse(trimmed);
+	if (Number.isNaN(dateMs)) return null;
+	return Math.max(0, dateMs - Date.now());
+}
+
+function exponentialBackoffMs(attempt: number, maxWaitMs: number, multiplierMs: number): number {
+	const jitter = Math.random() * 1000;
+	return Math.min(multiplierMs * 2 ** attempt + jitter, maxWaitMs);
+}
+
+function isRetryableError(error: Error): boolean {
+	if (error.name === "AbortError") return false;
+	if (error instanceof HttpStatusError) return RETRYABLE_STATUS.has(error.status);
+	return true;
+}
 
 async function fetchWithRetry(
 	url: string,
 	init: RequestInit,
-	maxRetries = 3,
+	maxRetries = getRetryConfig().maxRetries,
 ): Promise<Response> {
 	let lastError: Error | null = null;
+	const retryConfig = getRetryConfig();
 
 	for (let attempt = 0; attempt <= maxRetries; attempt++) {
 		try {
 			const response = await fetch(url, init);
 
-			if (response.status === 429) {
-				const retryAfter = response.headers.get("Retry-After");
-				let waitMs: number;
-				if (retryAfter && /^\d+$/.test(retryAfter.trim())) {
-					waitMs = parseInt(retryAfter, 10) * 1000;
-				} else {
-					waitMs = Math.min(1000 * 2 ** attempt + Math.random() * 1000, 10000);
-				}
-				await sleep(waitMs);
-				continue;
-			}
-
-			if (RETRYABLE_STATUS.has(response.status) && attempt < maxRetries) {
-				await sleep(Math.min(1000 * 2 ** attempt, 10000));
-				continue;
-			}
-
 			if (!response.ok) {
 				const text = await response.text().catch(() => "");
-				throw new Error(`HTTP ${response.status}: ${text.slice(0, 300)}`);
+				const error = new HttpStatusError(response.status, text);
+				const shouldRetry = RETRYABLE_STATUS.has(response.status) && attempt < maxRetries;
+				if (shouldRetry) {
+					const retryAfterMs =
+						response.status === 429
+							? parseRetryAfterMs(response.headers.get("Retry-After"))
+							: null;
+					await sleep(
+						retryAfterMs ??
+							exponentialBackoffMs(
+								attempt,
+								retryConfig.maxWaitMs,
+								retryConfig.multiplierMs,
+							),
+					);
+					continue;
+				}
+				throw error;
 			}
 
 			return response;
 		} catch (e) {
 			lastError = e instanceof Error ? e : new Error(String(e));
-			if (lastError.name === "AbortError") throw lastError;
-			if (attempt < maxRetries) {
-				await sleep(Math.min(1000 * 2 ** attempt, 10000));
-			}
+			if (!isRetryableError(lastError) || attempt >= maxRetries) throw lastError;
+			await sleep(
+				exponentialBackoffMs(
+					attempt,
+					retryConfig.maxWaitMs,
+					retryConfig.multiplierMs,
+				),
+			);
 		}
 	}
 
@@ -438,6 +491,122 @@ async function fetchWithRetry(
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((r) => setTimeout(r, ms));
+}
+
+function abortSignalAny(signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
+	const active = signals.filter((signal): signal is AbortSignal => !!signal);
+	if (active.length === 0) return undefined;
+	if (active.length === 1) return active[0];
+	if (typeof AbortSignal.any === "function") return AbortSignal.any(active);
+
+	const controller = new AbortController();
+	const abort = () => controller.abort();
+	for (const signal of active) {
+		if (signal.aborted) {
+			abort();
+			break;
+		}
+		signal.addEventListener("abort", abort, { once: true });
+	}
+	return controller.signal;
+}
+
+function truncateText(
+	text: string,
+	options: { maxBytes?: number; maxLines?: number } = {},
+): { content: string; truncated: boolean; totalBytes: number; totalLines: number; outputBytes: number; outputLines: number } {
+	const maxBytes = options.maxBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
+	const maxLines = options.maxLines ?? DEFAULT_MAX_OUTPUT_LINES;
+	const lines = text.split(/\r?\n/);
+	const totalBytes = Buffer.byteLength(text, "utf8");
+	const totalLines = lines.length;
+	let outputLines = 0;
+	let outputBytes = 0;
+	const kept: string[] = [];
+
+	for (const line of lines) {
+		if (outputLines >= maxLines || outputBytes >= maxBytes) break;
+		const separator = kept.length > 0 ? "\n" : "";
+		const availableBytes = maxBytes - outputBytes - Buffer.byteLength(separator, "utf8");
+		if (availableBytes <= 0) break;
+
+		const lineBytes = Buffer.byteLength(line, "utf8");
+		if (lineBytes > availableBytes) {
+			let chunk = "";
+			let chunkBytes = 0;
+			for (const char of line) {
+				const charBytes = Buffer.byteLength(char, "utf8");
+				if (chunkBytes + charBytes > availableBytes) break;
+				chunk += char;
+				chunkBytes += charBytes;
+			}
+			if (chunk) {
+				kept.push(chunk);
+				outputLines++;
+				outputBytes += Buffer.byteLength(separator + chunk, "utf8");
+			}
+			break;
+		}
+
+		kept.push(line);
+		outputLines++;
+		outputBytes += Buffer.byteLength(separator + line, "utf8");
+	}
+
+	const truncated = outputLines < totalLines || outputBytes < totalBytes;
+	return {
+		content: kept.join("\n"),
+		truncated,
+		totalBytes,
+		totalLines,
+		outputBytes,
+		outputLines,
+	};
+}
+
+async function saveFullOutput(prefix: string, content: string): Promise<string | null> {
+	try {
+		const dir = join(tmpdir(), "pi-grok-search");
+		await mkdir(dir, { recursive: true });
+		const safePrefix = prefix.replace(/[^a-z0-9_-]/gi, "_").slice(0, 40) || "output";
+		const file = join(dir, `${safePrefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.md`);
+		await writeFile(file, content, "utf8");
+		return file;
+	} catch {
+		return null;
+	}
+}
+
+function formatSize(bytes: number): string {
+	if (bytes < 1024) return `${bytes}B`;
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+	return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
+}
+
+async function truncateToolOutput(content: string, prefix: string): Promise<{
+	content: string;
+	truncated: boolean;
+	fullOutputPath?: string;
+	outputBytes: number;
+	totalBytes: number;
+	outputLines: number;
+	totalLines: number;
+}> {
+	const truncation = truncateText(content);
+	if (!truncation.truncated) return truncation;
+
+	const fullOutputPath = await saveFullOutput(prefix, content);
+	let notice =
+		`\n\n[Output truncated: ${truncation.outputLines} of ${truncation.totalLines} lines ` +
+		`(${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}).`;
+	if (fullOutputPath) notice += ` Full output saved to: ${fullOutputPath}`;
+	notice += "]";
+
+	return {
+		...truncation,
+		content: truncation.content + notice,
+		fullOutputPath: fullOutputPath || undefined,
+	};
 }
 
 function newSessionId(): string {
@@ -522,6 +691,13 @@ function needsTimeContext(query: string): boolean {
 
 const URL_PATTERN = /https?:\/\/[^\s<>"'`，。、；：！？》）】)]+/g;
 const MD_LINK_PATTERN = /\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g;
+const MD_LINK_LINE_PATTERN = /\[[^\]]+\]\(https?:\/\/[^)]+\)/;
+const SOURCES_HEADING_PATTERN =
+	/(?:^|\n)(?:#{1,6}\s*)?(?:\*\*|__)?\s*(?:sources?|references?|citations?|信源|参考资料|参考|引用|来源列表|来源)\s*(?:\*\*|__)?(?:\s*[（(][^)\n]*[)）])?\s*[:：]?\s*$/gim;
+const SOURCES_FUNCTION_PATTERN =
+	/(^|\n)\s*(sources|source|citations|citation|references|reference|citation_card|source_cards|source_card)\s*\(/gim;
+
+type UnknownRecord = Record<string, unknown>;
 
 function extractUrls(text: string): string[] {
 	const seen = new Set<string>();
@@ -564,41 +740,230 @@ function splitAnswerAndSources(text: string): {
 	const trimmed = text.trim();
 	if (!trimmed) return { answer: "", sources: [] };
 
-	// Try to find Sources/References/信源 heading
-	const headingPattern =
-		/(?:^|\n)(?:#{1,6}\s*)?(?:\*\*)?\s*(?:sources?|references?|citations?|信源|参考资料|参考|引用|来源)\s*(?:\*\*)?\s*[:：]?\s*$/im;
-	const match = headingPattern.exec(trimmed);
-	if (match) {
-		const sourcesText = trimmed.slice(match.index);
-		const sources = extractSourcesFromText(sourcesText);
-		if (sources.length > 0) {
-			return { answer: trimmed.slice(0, match.index).trim(), sources };
+	return (
+		splitFunctionCallSources(trimmed) ||
+		splitHeadingSources(trimmed) ||
+		splitDetailsBlockSources(trimmed) ||
+		splitTailLinkBlock(trimmed) ||
+		{ answer: trimmed, sources: [] }
+	);
+}
+
+function splitFunctionCallSources(text: string): { answer: string; sources: Source[] } | null {
+	const matches = [...text.matchAll(SOURCES_FUNCTION_PATTERN)];
+	for (let i = matches.length - 1; i >= 0; i--) {
+		const match = matches[i];
+		const openParenIndex = (match.index ?? 0) + match[0].length - 1;
+		const extracted = extractBalancedCallAtEnd(text, openParenIndex);
+		if (!extracted) continue;
+		const sources = parseSourcesPayload(extracted.argsText);
+		if (sources.length === 0) continue;
+		return { answer: text.slice(0, match.index).trimEnd(), sources };
+	}
+	return null;
+}
+
+function extractBalancedCallAtEnd(
+	text: string,
+	openParenIndex: number,
+): { closeParenIndex: number; argsText: string } | null {
+	if (text[openParenIndex] !== "(") return null;
+	let depth = 1;
+	let inString: string | null = null;
+	let escape = false;
+
+	for (let index = openParenIndex + 1; index < text.length; index++) {
+		const ch = text[index];
+		if (inString) {
+			if (escape) {
+				escape = false;
+				continue;
+			}
+			if (ch === "\\") {
+				escape = true;
+				continue;
+			}
+			if (ch === inString) inString = null;
+			continue;
+		}
+
+		if (ch === '"' || ch === "'") {
+			inString = ch;
+			continue;
+		}
+		if (ch === "(") {
+			depth++;
+			continue;
+		}
+		if (ch === ")") {
+			depth--;
+			if (depth === 0) {
+				if (text.slice(index + 1).trim()) return null;
+				return { closeParenIndex: index, argsText: text.slice(openParenIndex + 1, index) };
+			}
 		}
 	}
+	return null;
+}
 
-	// Try tail link block
-	const lines = trimmed.split("\n");
-	let tailStart = lines.length;
+function splitHeadingSources(text: string): { answer: string; sources: Source[] } | null {
+	const matches = [...text.matchAll(SOURCES_HEADING_PATTERN)];
+	for (let i = matches.length - 1; i >= 0; i--) {
+		const match = matches[i];
+		const start = match.index ?? 0;
+		const sources = extractSourcesFromText(text.slice(start));
+		if (sources.length === 0) continue;
+		return { answer: text.slice(0, start).trimEnd(), sources };
+	}
+	return null;
+}
+
+function splitDetailsBlockSources(text: string): { answer: string; sources: Source[] } | null {
+	const lower = text.toLowerCase();
+	const closeIndex = lower.lastIndexOf("</details>");
+	if (closeIndex === -1) return null;
+	if (text.slice(closeIndex + "</details>".length).trim()) return null;
+	const openIndex = lower.lastIndexOf("<details", closeIndex);
+	if (openIndex === -1) return null;
+	const blockText = text.slice(openIndex, closeIndex + "</details>".length);
+	const sources = extractSourcesFromText(blockText);
+	if (sources.length < 2) return null;
+	return { answer: text.slice(0, openIndex).trimEnd(), sources };
+}
+
+function splitTailLinkBlock(text: string): { answer: string; sources: Source[] } | null {
+	const lines = text.split(/\r?\n/);
+	let index = lines.length - 1;
+	while (index >= 0 && !lines[index].trim()) index--;
+	if (index < 0) return null;
+
+	const tailEnd = index;
 	let linkCount = 0;
-	for (let i = lines.length - 1; i >= 0; i--) {
-		const line = lines[i].trim();
-		if (!line) continue;
-		if (/^https?:\/\//.test(line) || MD_LINK_PATTERN.test(line)) {
-			linkCount++;
-			tailStart = i;
-		} else {
-			break;
+	while (index >= 0) {
+		const line = lines[index].trim();
+		if (!line) {
+			index--;
+			continue;
+		}
+		if (!isLinkOnlyLine(line)) break;
+		linkCount++;
+		index--;
+	}
+
+	const tailStart = index + 1;
+	if (linkCount < 2) return null;
+	const sources = extractSourcesFromText(lines.slice(tailStart, tailEnd + 1).join("\n"));
+	if (sources.length === 0) return null;
+	return { answer: lines.slice(0, tailStart).join("\n").trimEnd(), sources };
+}
+
+function isLinkOnlyLine(line: string): boolean {
+	const stripped = line.replace(/^\s*(?:[-*]|\d+\.)\s*/, "").trim();
+	return !!stripped && (stripped.startsWith("http://") || stripped.startsWith("https://") || MD_LINK_LINE_PATTERN.test(stripped));
+}
+
+function parseSourcesPayload(payload: string): Source[] {
+	const trimmed = payload.trim().replace(/;\s*$/, "");
+	if (!trimmed) return [];
+
+	const jsonSources = parseJsonLikeSources(trimmed);
+	if (jsonSources.length > 0) return jsonSources;
+	return extractSourcesFromText(trimmed);
+}
+
+function parseJsonLikeSources(payload: string): Source[] {
+	for (const candidate of jsonCandidates(payload)) {
+		try {
+			return normalizeSources(JSON.parse(candidate));
+		} catch {
+			// try next compatibility transform
 		}
 	}
-	if (linkCount >= 2) {
-		const tailText = lines.slice(tailStart).join("\n");
-		const sources = extractSourcesFromText(tailText);
-		if (sources.length > 0) {
-			return { answer: lines.slice(0, tailStart).join("\n").trim(), sources };
+	return [];
+}
+
+function jsonCandidates(payload: string): string[] {
+	const candidates = [payload];
+	// Best-effort compatibility for Python literal output: single quotes and booleans.
+	const pythonish = payload
+		.replace(/\bNone\b/g, "null")
+		.replace(/\bTrue\b/g, "true")
+		.replace(/\bFalse\b/g, "false")
+		.replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_m, inner: string) => JSON.stringify(inner.replace(/\\'/g, "'")));
+	if (pythonish !== payload) candidates.push(pythonish);
+	return candidates;
+}
+
+function normalizeSources(data: unknown): Source[] {
+	let items: unknown[];
+	if (Array.isArray(data)) {
+		items = data;
+	} else if (isRecord(data)) {
+		for (const key of ["sources", "citations", "references", "urls"]) {
+			if (key in data) return normalizeSources(data[key]);
+		}
+		items = [data];
+	} else {
+		items = [data];
+	}
+
+	const normalized: Source[] = [];
+	const seen = new Set<string>();
+
+	for (const item of items) {
+		for (const source of normalizeSourceItem(item)) {
+			const url = source.url.trim();
+			if (!url || seen.has(url)) continue;
+			seen.add(url);
+			normalized.push({ ...source, url });
 		}
 	}
 
-	return { answer: trimmed, sources: [] };
+	return normalized;
+}
+
+function normalizeSourceItem(item: unknown): Source[] {
+	if (typeof item === "string") return extractUrls(item).map((url) => ({ url }));
+
+	if (Array.isArray(item) && item.length >= 2) {
+		const [title, url] = item;
+		if (typeof url === "string" && /^https?:\/\//.test(url)) {
+			return [
+				{
+					url,
+					...(typeof title === "string" && title.trim() ? { title: title.trim() } : {}),
+				},
+			];
+		}
+	}
+
+	if (isRecord(item)) {
+		const url = firstString(item, ["url", "href", "link"]);
+		if (!url || !/^https?:\/\//.test(url)) return [];
+		const title = firstString(item, ["title", "name", "label"]);
+		const description = firstString(item, ["description", "snippet", "content"]);
+		return [
+			{
+				url,
+				...(title?.trim() ? { title: title.trim() } : {}),
+				...(description?.trim() ? { description: description.trim() } : {}),
+			},
+		];
+	}
+
+	return [];
+}
+
+function isRecord(value: unknown): value is UnknownRecord {
+	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function firstString(record: UnknownRecord, keys: string[]): string | undefined {
+	for (const key of keys) {
+		const value = record[key];
+		if (typeof value === "string" && value.trim()) return value;
+	}
+	return undefined;
 }
 
 function mergeSources(...lists: Source[][]): Source[] {
@@ -606,12 +971,20 @@ function mergeSources(...lists: Source[][]): Source[] {
 	const merged: Source[] = [];
 	for (const list of lists) {
 		for (const item of list) {
-			if (!item.url || seen.has(item.url)) continue;
-			seen.add(item.url);
-			merged.push(item);
+			const url = item.url?.trim();
+			if (!url || seen.has(url)) continue;
+			seen.add(url);
+			merged.push({ ...item, url });
 		}
 	}
 	return merged;
+}
+
+function getSettledValue<T>(
+	result: PromiseSettledResult<unknown> | undefined,
+	fallback: T,
+): T {
+	return result?.status === "fulfilled" ? (result.value as T) : fallback;
 }
 
 // =============================================================================
@@ -699,6 +1072,7 @@ async function parseStreamResponse(response: Response): Promise<string> {
 	const decoder = new TextDecoder();
 	let content = "";
 	let buffer = "";
+	const rawLines: string[] = [];
 
 	try {
 		while (true) {
@@ -711,7 +1085,9 @@ async function parseStreamResponse(response: Response): Promise<string> {
 
 			for (const line of lines) {
 				const trimmed = line.trim();
-				if (!trimmed || !trimmed.startsWith("data:")) continue;
+				if (!trimmed) continue;
+				rawLines.push(trimmed);
+				if (!trimmed.startsWith("data:")) continue;
 				if (trimmed === "data: [DONE]" || trimmed === "data:[DONE]") continue;
 
 				try {
@@ -723,20 +1099,27 @@ async function parseStreamResponse(response: Response): Promise<string> {
 				}
 			}
 		}
+
+		const trailing = buffer.trim();
+		if (trailing) rawLines.push(trailing);
 	} finally {
 		reader.releaseLock();
 	}
 
-	// Fallback: non-streaming
-	if (!content) {
-		try {
-			const data = (await response.clone().json()) as Record<string, unknown>;
-			const choices = data.choices as
-				| Array<{ message?: { content?: string } }>
-				| undefined;
-			content = choices?.[0]?.message?.content || "";
-		} catch {
-			// ignore
+	// Fallback: non-streaming JSON or providers that buffer a full JSON object.
+	if (!content && rawLines.length > 0) {
+		const candidates = [rawLines.join(""), rawLines.join("\n")];
+		for (const candidate of candidates) {
+			try {
+				const data = JSON.parse(candidate) as {
+					choices?: Array<{ message?: { content?: string }; delta?: { content?: string } }>;
+				};
+				const choice = data.choices?.[0];
+				content = choice?.message?.content || choice?.delta?.content || "";
+				if (content) break;
+			} catch {
+				// try next candidate
+			}
 		}
 	}
 
@@ -842,6 +1225,7 @@ async function tavilyMap(
 	}
 
 	const timeout = options.timeout || 150;
+	const timeoutSignal = AbortSignal.timeout((timeout + 10) * 1000);
 
 	try {
 		const response = await fetch(
@@ -862,7 +1246,7 @@ async function tavilyMap(
 						? { instructions: options.instructions }
 						: {}),
 				}),
-				signal: AbortSignal.timeout((timeout + 10) * 1000),
+				signal: abortSignalAny([signal, timeoutSignal]),
 			},
 		);
 
@@ -1072,12 +1456,14 @@ export default function (pi: ExtensionAPI) {
 				Type.Number({
 					description:
 						"额外补充信源数量（Tavily/Firecrawl），0 为关闭。默认 0。",
+					minimum: 0,
+					maximum: 50,
 				}),
 			),
 		}),
 
 		async execute(_toolCallId, params, signal, onUpdate) {
-			onUpdate?.({ content: [{ type: "text", text: "🔍 正在搜索..." }] });
+			onUpdate?.({ content: [{ type: "text", text: "🔍 正在搜索..." }], details: {} });
 
 			try {
 				const config = await configManager.getFullConfig();
@@ -1103,17 +1489,15 @@ export default function (pi: ExtensionAPI) {
 
 				const results = await Promise.allSettled(tasks);
 
-				const grokResult =
-					results[0].status === "fulfilled" ? (results[0].value as string) : "";
+				const grokResult = getSettledValue<string>(results[0], "");
+				let resultIndex = 1;
 				const tavilySources =
-					extraCount > 0 && hasTavily && results[1]?.status === "fulfilled"
-						? (results[1].value as Source[])
+					extraCount > 0 && hasTavily
+						? getSettledValue<Source[]>(results[resultIndex++], [])
 						: [];
 				const firecrawlSources =
-					extraCount > 0 &&
-					hasFirecrawl &&
-					results[results.length - 1]?.status === "fulfilled"
-						? (results[results.length - 1].value as Source[])
+					extraCount > 0 && hasFirecrawl
+						? getSettledValue<Source[]>(results[resultIndex], [])
 						: [];
 
 				// Parse Grok response
@@ -1235,7 +1619,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 
 		async execute(_toolCallId, params, signal, onUpdate) {
-			onUpdate?.({ content: [{ type: "text", text: "📄 正在抓取网页..." }] });
+			onUpdate?.({ content: [{ type: "text", text: "📄 正在抓取网页..." }], details: {} });
 
 			const config = await configManager.getFullConfig();
 
@@ -1243,9 +1627,11 @@ export default function (pi: ExtensionAPI) {
 			if (config.tavilyApiKey) {
 				const result = await tavilyExtract(params.url, signal);
 				if (result) {
+					const output = await truncateToolOutput(result, "web-fetch-tavily");
+					const { content, ...outputDetails } = output;
 					return {
-						content: [{ type: "text", text: result }],
-						details: { url: params.url, provider: "tavily" },
+						content: [{ type: "text", text: content }],
+						details: { url: params.url, provider: "tavily", ...outputDetails },
 					};
 				}
 			}
@@ -1256,12 +1642,15 @@ export default function (pi: ExtensionAPI) {
 					content: [
 						{ type: "text", text: "📄 Tavily 失败，尝试 Firecrawl..." },
 					],
+					details: {},
 				});
 				const result = await firecrawlScrape(params.url, signal);
 				if (result) {
+					const output = await truncateToolOutput(result, "web-fetch-firecrawl");
+					const { content, ...outputDetails } = output;
 					return {
-						content: [{ type: "text", text: result }],
-						details: { url: params.url, provider: "firecrawl" },
+						content: [{ type: "text", text: content }],
+						details: { url: params.url, provider: "firecrawl", ...outputDetails },
 					};
 				}
 			}
@@ -1315,16 +1704,16 @@ export default function (pi: ExtensionAPI) {
 				}),
 			),
 			max_depth: Type.Optional(
-				Type.Number({ description: "最大遍历深度（1-5），默认 1" }),
+				Type.Number({ description: "最大遍历深度（1-5），默认 1", minimum: 1, maximum: 5 }),
 			),
 			max_breadth: Type.Optional(
-				Type.Number({ description: "每页最大跟踪链接数（1-500），默认 20" }),
+				Type.Number({ description: "每页最大跟踪链接数（1-500），默认 20", minimum: 1, maximum: 500 }),
 			),
 			limit: Type.Optional(
-				Type.Number({ description: "总链接处理上限（1-500），默认 50" }),
+				Type.Number({ description: "总链接处理上限（1-500），默认 50", minimum: 1, maximum: 500 }),
 			),
 			timeout: Type.Optional(
-				Type.Number({ description: "超时秒数（10-150），默认 150" }),
+				Type.Number({ description: "超时秒数（10-150），默认 150", minimum: 10, maximum: 150 }),
 			),
 		}),
 
