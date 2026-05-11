@@ -21,9 +21,9 @@ pi ──Extension──► pi-grok-search
 
 ## Features
 
-- **🔍 AI Deep Search** — Grok-powered, auto time injection, platform focus
-- **📄 Web Fetch** — Tavily Extract → Firecrawl Scrape auto-fallback
-- **🗺️ Site Mapping** — Tavily Map traverses website structure
+- **🔍 AI Deep Search** — Grok-powered, auto time injection, platform focus, compact output by default
+- **📄 Web Fetch** — Tavily Extract → Firecrawl Scrape auto-fallback, preview output by default
+- **🗺️ Site Mapping** — Tavily Map traverses website structure with conservative defaults
 - **📋 Search Planning** — 6-phase structured planning
 - **💾 Source Cache** — session_id indexed, on-demand retrieval
 - **🔄 Smart Retry** — Retry-After header parsing + exponential backoff
@@ -105,25 +105,46 @@ Persisted to `~/.config/pi-grok-search/config.json`:
 
 ### Commands
 
-| Command | Description |
-|---------|-------------|
-| `/grok-search <query>` | Search the web |
-| `/grok-config` | Interactive configuration |
-| `/grok-model [model-id]` | Switch Grok model |
-| `/pi-ext-docs [topic]` | Search pi Extension docs |
+| Command                  | Description               |
+| ------------------------ | ------------------------- |
+| `/grok-search <query>`   | Search the web            |
+| `/grok-config`           | Interactive configuration |
+| `/grok-model [model-id]` | Switch Grok model         |
+| `/pi-ext-docs [topic]`   | Search pi Extension docs  |
 
 ### Tools (Auto-invoked by LLM)
 
-| Tool | Description |
-|------|-------------|
-| `grok_search` | AI deep search, returns results + session_id |
-| `grok_sources` | Retrieve source list by session_id |
-| `web_fetch` | Fetch web content (Tavily → Firecrawl auto-fallback) |
-| `web_map` | Traverse website structure, generate site map |
-| `grok_config` | View / modify / test configuration |
-| `search_planning` | 6-phase structured search planning |
+| Tool              | Description                                          |
+| ----------------- | ---------------------------------------------------- |
+| `grok_search`     | AI search with compact default output + session_id      |
+| `grok_sources`    | Retrieve paginated source list by session_id            |
+| `web_fetch`       | Fetch web content preview (Tavily → Firecrawl fallback) |
+| `web_map`         | Traverse website structure with bounded output          |
+| `grok_config`     | View / modify / test configuration                   |
+| `search_planning` | 6-phase structured search planning                   |
 
 After installation, LLM automatically recognizes these tools and decides when to call them.
+
+### Search Result Controls
+
+To avoid context blow-ups, conservative budgets are enabled by default:
+
+- `grok_search` defaults to `mode=compact`; use `mode=deep` only for explicit deep-research requests
+- `extra_sources` is a shared Tavily/Firecrawl source budget, not a per-provider multiplier
+- `grok_sources` supports `limit` / `offset` pagination and defaults to 20 sources per call
+- `web_fetch` returns an approximately 12KB preview by default; use `max_output_bytes` to enlarge one call
+- `web_map` defaults to `max_breadth=10`, `limit=30`, and uses the shared output truncation path
+
+Common parameters:
+
+```json
+{
+  "mode": "compact | normal | deep | sources_only",
+  "max_answer_chars": 6000,
+  "max_sources": 8,
+  "max_output_bytes": 12000
+}
+```
 
 ## Search Quality Guidelines
 

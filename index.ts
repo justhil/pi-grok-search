@@ -48,6 +48,22 @@ interface Source {
 	provider?: string;
 }
 
+type SearchMode = "compact" | "normal" | "deep" | "sources_only";
+
+interface SearchControls {
+	mode: SearchMode;
+	maxAnswerChars: number;
+	maxSources: number;
+	maxOutputBytes: number;
+}
+
+interface SearchControlInput {
+	mode?: string;
+	max_answer_chars?: number;
+	max_sources?: number;
+	max_output_bytes?: number;
+}
+
 interface PlanningSession {
 	sessionId: string;
 	phases: Record<string, PhaseRecord>;
@@ -417,9 +433,16 @@ function beginStatus(ctx: StatusContext, text: string): () => void {
 // =============================================================================
 
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
-const DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024;
-const DEFAULT_MAX_OUTPUT_LINES = 2000;
+const DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024;
+const DEFAULT_MAX_OUTPUT_LINES = 800;
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
+const SEARCH_MODE_VALUES: SearchMode[] = ["compact", "normal", "deep", "sources_only"];
+const SEARCH_MODE_DEFAULTS: Record<SearchMode, Omit<SearchControls, "mode">> = {
+	compact: { maxAnswerChars: 6000, maxSources: 8, maxOutputBytes: 12 * 1024 },
+	normal: { maxAnswerChars: 12000, maxSources: 12, maxOutputBytes: 20 * 1024 },
+	deep: { maxAnswerChars: 24000, maxSources: 20, maxOutputBytes: 32 * 1024 },
+	sources_only: { maxAnswerChars: 0, maxSources: 20, maxOutputBytes: 10 * 1024 },
+};
 
 function getDebugConfig(): { enabled: boolean; logDir: string; level: string } {
 	const enabled = ["true", "1", "yes", "on"].includes(
@@ -695,7 +718,7 @@ function formatSize(bytes: number): string {
 	return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
 }
 
-async function truncateToolOutput(content: string, prefix: string): Promise<{
+async function truncateToolOutput(content: string, prefix: string, options: { maxBytes?: number; maxLines?: number } = {}): Promise<{
 	content: string;
 	truncated: boolean;
 	fullOutputPath?: string;
@@ -704,7 +727,7 @@ async function truncateToolOutput(content: string, prefix: string): Promise<{
 	outputLines: number;
 	totalLines: number;
 }> {
-	const truncation = truncateText(content);
+	const truncation = truncateText(content, options);
 	if (!truncation.truncated) return truncation;
 
 	const fullOutputPath = await saveFullOutput(prefix, content);
@@ -1099,6 +1122,45 @@ function getSettledValue<T>(
 	return result?.status === "fulfilled" ? (result.value as T) : fallback;
 }
 
+function clampNumber(value: number | undefined, fallback: number, min: number, max: number): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+	return Math.min(Math.max(Math.floor(value), min), max);
+}
+
+function resolveSearchControls(input: SearchControlInput): SearchControls {
+	const mode = SEARCH_MODE_VALUES.includes(input.mode as SearchMode)
+		? (input.mode as SearchMode)
+		: "compact";
+	const defaults = SEARCH_MODE_DEFAULTS[mode];
+	return {
+		mode,
+		maxAnswerChars: clampNumber(input.max_answer_chars, defaults.maxAnswerChars, 0, 50000),
+		maxSources: clampNumber(input.max_sources, defaults.maxSources, 0, 50),
+		maxOutputBytes: clampNumber(input.max_output_bytes, defaults.maxOutputBytes, 3000, 50 * 1024),
+	};
+}
+
+function limitText(text: string, maxChars: number): { text: string; truncated: boolean } {
+	if (maxChars <= 0) return { text: "", truncated: text.trim().length > 0 };
+	if (text.length <= maxChars) return { text, truncated: false };
+	return { text: text.slice(0, maxChars).trimEnd(), truncated: true };
+}
+
+function limitSources(sources: Source[], maxSources: number): Source[] {
+	if (maxSources <= 0) return [];
+	return sources.slice(0, maxSources);
+}
+
+function splitExtraSourceBudget(total: number, hasTavily: boolean, hasFirecrawl: boolean): { tavily: number; firecrawl: number } {
+	const budget = clampNumber(total, 0, 0, 50);
+	if (budget === 0) return { tavily: 0, firecrawl: 0 };
+	if (hasTavily && hasFirecrawl) {
+		const tavily = Math.ceil(budget * 0.6);
+		return { tavily, firecrawl: budget - tavily };
+	}
+	return { tavily: hasTavily ? budget : 0, firecrawl: hasFirecrawl ? budget : 0 };
+}
+
 async function fetchAvailableModels(
 	apiUrl: string,
 	apiKey: string,
@@ -1147,6 +1209,7 @@ async function grokSearch(
 	platform = "",
 	signal?: AbortSignal,
 	modelOverride = "",
+	controls: SearchControls = resolveSearchControls({}),
 ): Promise<string> {
 	const config = await configManager.getFullConfig();
 	if (!config.grokApiUrl || !config.grokApiKey) {
@@ -1167,7 +1230,7 @@ async function grokSearch(
 	const payload = {
 		model: effectiveModel,
 		messages: [
-			{ role: "system", content: SEARCH_PROMPT },
+			{ role: "system", content: buildSearchPrompt(controls) },
 			{ role: "user", content: timeContext + query + platformPrompt },
 		],
 		stream: true,
@@ -1364,8 +1427,8 @@ async function tavilyMap(
 				body: JSON.stringify({
 					url,
 					max_depth: options.maxDepth || 1,
-					max_breadth: options.maxBreadth || 20,
-					limit: options.limit || 50,
+					max_breadth: options.maxBreadth || 10,
+					limit: options.limit || 30,
 					timeout,
 					...(options.instructions
 						? { instructions: options.instructions }
@@ -1514,31 +1577,42 @@ const grokConfigParameters = Type.Object({
 	value: Type.Optional(Type.String()),
 });
 
-const SEARCH_PROMPT = `# Core Instruction
+const SEARCH_PROMPT_BASE = `# Core Instruction
 
-1. User needs may be vague. Think divergently, infer intent from multiple angles, and leverage full conversation context to progressively clarify their true needs.
-2. **Breadth-First Search**—Approach problems from multiple dimensions. Brainstorm 5+ perspectives and execute parallel searches for each. Consult as many high-quality sources as possible before responding.
-3. **Depth-First Search**—After broad exploration, select ≥2 most relevant perspectives for deep investigation into specialized knowledge.
-4. **Evidence-Based Reasoning & Traceable Sources**—Every claim must be followed by a citation (URL). More credible sources strengthen arguments. If no references exist, remain silent.
-5. Before responding, ensure full execution of Steps 1–4.
-
-# Search Instruction
-
-1. Think carefully before responding—anticipate the user's true intent to ensure precision.
-2. Verify every claim rigorously to avoid misinformation.
-3. Follow problem logic—dig deeper until clues are exhaustively clear. If a question seems simple, still infer broader intent and search accordingly. Use multiple parallel tool calls per query and ensure answers are well-sourced.
-4. Search in English first (prioritizing English resources for volume/quality), but switch to Chinese if context demands.
-5. Prioritize authoritative sources: Wikipedia, academic databases, books, reputable media/journalism.
-6. Favor sharing in-depth, specialized knowledge over generic or common-sense content.
+1. Infer the user's intent from the query, but do not broaden the task unless necessary.
+2. Verify factual claims with authoritative sources before answering.
+3. Prefer official documentation, academic databases, reputable media, and primary sources.
+4. Cite sources at paragraph or table-row level. Do not cite every sentence.
+5. Be concise and stay within the output budget.
 
 # Output Style
 
-0. **Be direct—no unnecessary follow-ups**.
-1. Lead with the **most probable solution** before detailed analysis.
-2. **Define every technical term** in plain language.
-3. **Every sentence must cite sources** (URLs). Silence if uncited.
-4. **Strictly format outputs in polished Markdown**.
+1. Lead with the most probable answer or solution.
+2. Use polished Markdown.
+3. Define technical terms only when they are necessary for understanding.
+4. State limitations when evidence is incomplete or conflicting.
 `;
+
+function buildSearchPrompt(controls: SearchControls): string {
+	const sourceLimit = controls.maxSources > 0
+		? `Return at most ${controls.maxSources} source links in the final source/reference block.`
+		: "Do not include a final source/reference block.";
+	const answerLimit = controls.maxAnswerChars > 0
+		? `Keep the answer under ${controls.maxAnswerChars} characters.`
+		: "Do not write a prose answer; return only source links with terse labels.";
+	const modeInstruction: Record<SearchMode, string> = {
+		compact:
+			"Mode: compact. Return a short answer, key evidence, and only the most relevant sources.",
+		normal:
+			"Mode: normal. Return a complete but bounded answer with concise evidence and sources.",
+		deep:
+			"Mode: deep. Explore multiple angles, but still respect the output budget and avoid unnecessary background.",
+		sources_only:
+			"Mode: sources_only. Do not synthesize a long answer. Return the most relevant sources with one-line relevance notes.",
+	};
+
+	return `${SEARCH_PROMPT_BASE}\n# Search Budget\n\n${modeInstruction[controls.mode]}\n${answerLimit}\n${sourceLimit}\n`;
+}
 
 // =============================================================================
 // Extension Entry Point
@@ -1553,8 +1627,8 @@ export default function (pi: ExtensionAPI) {
 		label: "Grok Search",
 		description:
 			"通过 Grok API 执行 AI 驱动的深度网络搜索。自动检测时间相关查询并注入时间上下文。\n" +
-			"返回搜索结果正文和 session_id（用于 grok_sources 获取信源）。\n" +
-			"适用：查找技术文档、API 规范、开源项目、pi Extension 开发指南等。",
+			"返回受预算控制的搜索结果正文和 session_id（用于 grok_sources 获取信源）。\n" +
+			"默认 compact 模式，适用：查找技术文档、API 规范、开源项目、pi Extension 开发指南等。",
 		promptSnippet:
 			"通过 Grok API 执行 AI 深度网络搜索（文档、API、开源项目等）",
 		promptGuidelines: [
@@ -1572,8 +1646,9 @@ export default function (pi: ExtensionAPI) {
 			"Conflicting sources: Present evidence from both sides, assess credibility/timeliness, identify stronger evidence, or declare unresolved discrepancies.",
 			"Empirical conclusions MUST include confidence levels (High/Medium/Low).",
 			// === Post-Search Behavior ===
-			"After grok_search, call grok_sources with the returned session_id to retrieve source URLs if needed.",
-			"After grok_search returns results, use web_fetch to get full content from interesting URLs.",
+			"Use compact grok_search by default; only use mode=deep when the user explicitly asks for deep research or exhaustive analysis.",
+			"After grok_search, call grok_sources with the returned session_id to retrieve paged source URLs if needed.",
+			"After grok_search returns results, use web_fetch to preview selected URLs; only raise max_output_bytes when more detail is necessary.",
 			// === Output Standards ===
 			"All conclusions MUST specify: applicable conditions, scope boundaries, and known limitations.",
 			"When uncertain: state unknowns and reasons BEFORE presenting confirmed facts.",
@@ -1592,9 +1667,35 @@ export default function (pi: ExtensionAPI) {
 			extra_sources: Type.Optional(
 				Type.Number({
 					description:
-						"额外补充信源数量（Tavily/Firecrawl），0 为关闭。默认 0。",
+						"额外补充信源总预算（Tavily/Firecrawl 共享），0 为关闭。默认 0。",
 					minimum: 0,
 					maximum: 50,
+				}),
+			),
+			mode: Type.Optional(
+				StringEnum(["compact", "normal", "deep", "sources_only"] as const, {
+					description: "输出模式。默认 compact；deep 仅用于明确要求深度研究。",
+				}),
+			),
+			max_answer_chars: Type.Optional(
+				Type.Number({
+					description: "答案正文最大字符数。按 mode 有默认值。",
+					minimum: 0,
+					maximum: 50000,
+				}),
+			),
+			max_sources: Type.Optional(
+				Type.Number({
+					description: "本次返回的最大信源数量。完整信源仍缓存到 session_id。",
+					minimum: 0,
+					maximum: 50,
+				}),
+			),
+			max_output_bytes: Type.Optional(
+				Type.Number({
+					description: "工具返回内容最大字节数。默认按 mode 控制。",
+					minimum: 3000,
+					maximum: 51200,
 				}),
 			),
 			model: Type.Optional(
@@ -1607,6 +1708,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const config = await configManager.getFullConfig();
 			const effectiveModel = normalizeGrokModel(params.model || config.grokModel, config.grokApiUrl);
+			const controls = resolveSearchControls(params);
 			const endStatus = beginStatus(ctx, formatGrokStatus(effectiveModel));
 			onUpdate?.({ content: [{ type: "text", text: "🔍 正在搜索..." }], details: {} });
 
@@ -1616,7 +1718,7 @@ export default function (pi: ExtensionAPI) {
 				// Parallel: Grok search + optional Tavily/Firecrawl
 				const hasTavily = !!config.tavilyApiKey;
 				const hasFirecrawl = !!config.firecrawlApiKey;
-				const extraCount = params.extra_sources || 0;
+				const extraBudget = splitExtraSourceBudget(params.extra_sources || 0, hasTavily, hasFirecrawl);
 
 				if (params.model && config.grokApiUrl && config.grokApiKey) {
 					const models = await getAvailableModelsCached(
@@ -1630,16 +1732,14 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				const tasks: Promise<unknown>[] = [
-					grokSearch(params.query, params.platform || "", signal, effectiveModel),
+					grokSearch(params.query, params.platform || "", signal, effectiveModel, controls),
 				];
 
-				if (extraCount > 0 && hasTavily) {
-					tasks.push(tavilySearch(params.query, extraCount, signal));
+				if (extraBudget.tavily > 0) {
+					tasks.push(tavilySearch(params.query, extraBudget.tavily, signal));
 				}
-				if (extraCount > 0 && hasFirecrawl) {
-					tasks.push(
-						firecrawlSearch(params.query, Math.round(extraCount * 0.7), signal),
-					);
+				if (extraBudget.firecrawl > 0) {
+					tasks.push(firecrawlSearch(params.query, extraBudget.firecrawl, signal));
 				}
 
 				const results = await Promise.allSettled(tasks);
@@ -1654,11 +1754,11 @@ export default function (pi: ExtensionAPI) {
 				const grokResult = getSettledValue<string>(results[0], "");
 				let resultIndex = 1;
 				const tavilySources =
-					extraCount > 0 && hasTavily
+					extraBudget.tavily > 0
 						? getSettledValue<Source[]>(results[resultIndex++], [])
 						: [];
 				const firecrawlSources =
-					extraCount > 0 && hasFirecrawl
+					extraBudget.firecrawl > 0
 						? getSettledValue<Source[]>(results[resultIndex], [])
 						: [];
 
@@ -1675,29 +1775,38 @@ export default function (pi: ExtensionAPI) {
 				sourcesCache.set(sessionId, allSources);
 
 				// Build output
-				let output = answer;
+				const limitedAnswer = limitText(answer, controls.maxAnswerChars);
+				const visibleSources = limitSources(allSources, controls.maxSources);
+				let output = limitedAnswer.text;
+				if (limitedAnswer.truncated) {
+					output += `\n\n[Answer truncated to ${controls.maxAnswerChars} characters. Use narrower queries or mode=deep for a larger budget.]`;
+				}
 				if (!grokResult && allSources.length > 0) {
 					output = "⚠️ Grok 主搜索失败，仅返回补充信源。";
 				}
-				if (allSources.length > 0) {
-					output += `\n\n---\n**信源 (${allSources.length})** | session_id: \`${sessionId}\`\n`;
-					for (const s of allSources.slice(0, 10)) {
+				if (visibleSources.length > 0) {
+					output += `\n\n---\n**信源 (${visibleSources.length}/${allSources.length})** | session_id: \`${sessionId}\`\n`;
+					for (const s of visibleSources) {
 						output += s.title ? `- [${s.title}](${s.url})\n` : `- ${s.url}\n`;
 					}
-					if (allSources.length > 10) {
-						output += `- ... 还有 ${allSources.length - 10} 个信源，使用 grok_sources 获取\n`;
+					if (allSources.length > visibleSources.length) {
+						output += `- ... 还有 ${allSources.length - visibleSources.length} 个信源，使用 grok_sources 分页获取\n`;
 					}
+				} else if (allSources.length > 0) {
+					output += `\n\n---\n**信源已缓存 (${allSources.length})** | session_id: \`${sessionId}\`，使用 grok_sources 分页获取\n`;
 				}
+				if (!output.trim()) output = "未返回可显示内容。请尝试 normal/deep 模式或缩小查询。";
 
-				const finalOutput = await truncateToolOutput(output, "grok-search");
+				const finalOutput = await truncateToolOutput(output, "grok-search", { maxBytes: controls.maxOutputBytes });
 				const { content, ...outputDetails } = finalOutput;
 				return {
 					content: [{ type: "text", text: content }],
 					details: {
 						session_id: sessionId,
-						content: answer,
 						sources_count: allSources.length,
-						sources: allSources,
+						returned_sources_count: visibleSources.length,
+						answer_chars: answer.length,
+						mode: controls.mode,
 						model: effectiveModel,
 						...outputDetails,
 					},
@@ -1719,14 +1828,25 @@ export default function (pi: ExtensionAPI) {
 		name: "grok_sources",
 		label: "Grok Sources",
 		description:
-			"通过 session_id 获取之前 grok_search 缓存的完整信源列表。\n" +
+			"通过 session_id 分页获取之前 grok_search 缓存的信源列表。\n" +
 			"当对搜索结果感兴趣或需要更多参考链接时使用。",
 		promptSnippet: "通过 session_id 获取搜索信源列表",
 		promptGuidelines: [
-			"Use grok_sources with the session_id from grok_search to retrieve the full source list when you need more reference URLs.",
+			"Use grok_sources with the session_id from grok_search to retrieve source URLs page by page when you need more references.",
 		],
 		parameters: Type.Object({
 			session_id: Type.String({ description: "grok_search 返回的 session_id" }),
+			limit: Type.Optional(
+				Type.Number({ description: "本次返回信源数量（1-100），默认 20", minimum: 1, maximum: 100 }),
+			),
+			offset: Type.Optional(
+				Type.Number({ description: "从第几个信源开始返回，默认 0", minimum: 0 }),
+			),
+			format: Type.Optional(
+				StringEnum(["compact", "full"] as const, {
+					description: "compact 只返回标题/URL/provider；full 包含描述。默认 compact。",
+				}),
+			),
 		}),
 
 		async execute(_toolCallId, params) {
@@ -1741,29 +1861,43 @@ export default function (pi: ExtensionAPI) {
 					],
 					details: {
 						session_id: params.session_id,
-						sources: [],
+						offset: 0,
+						limit: 0,
+						returned_sources_count: 0,
 						sources_count: 0,
 					},
 				};
 			}
 
-			let output = `## 信源列表 (${sources.length})\n\n`;
-			for (const s of sources) {
+			const offset = clampNumber(params.offset, 0, 0, Math.max(0, sources.length));
+			const limit = clampNumber(params.limit, 20, 1, 100);
+			const page = sources.slice(offset, offset + limit);
+			const format = params.format || "compact";
+			const rangeStart = page.length > 0 ? offset + 1 : offset;
+			const rangeEnd = offset + page.length;
+			let output = `## 信源列表 (${rangeStart}-${rangeEnd}/${sources.length})\n\n`;
+			if (page.length === 0) output += "没有更多信源。\n";
+			for (const s of page) {
 				if (s.title) {
 					output += `- **[${s.title}](${s.url})**`;
 				} else {
 					output += `- ${s.url}`;
 				}
-				if (s.description) output += ` — ${s.description.slice(0, 100)}`;
+				if (format === "full" && s.description) output += ` — ${s.description.slice(0, 200)}`;
 				if (s.provider) output += ` [${s.provider}]`;
 				output += "\n";
+			}
+			if (offset + page.length < sources.length) {
+				output += `\n下一页: grok_sources(session_id=\`${params.session_id}\`, offset=${offset + page.length}, limit=${limit})\n`;
 			}
 
 			return {
 				content: [{ type: "text", text: output }],
 				details: {
 					session_id: params.session_id,
-					sources,
+					offset,
+					limit,
+					returned_sources_count: page.length,
 					sources_count: sources.length,
 				},
 			};
@@ -1777,20 +1911,24 @@ export default function (pi: ExtensionAPI) {
 		name: "web_fetch",
 		label: "Web Fetch",
 		description:
-			"抓取并提取指定 URL 的完整网页内容，返回 Markdown 格式。\n" +
+			"抓取并提取指定 URL 的网页内容，返回 Markdown 预览。\n" +
 			"优先使用 Tavily Extract，失败时自动降级到 Firecrawl Scrape。\n" +
-			"100% 内容保真，不做摘要或修改。",
-		promptSnippet: "抓取网页完整内容（Tavily → Firecrawl 自动降级）",
+			"默认限制返回大小，避免把网页全文注入上下文。",
+		promptSnippet: "抓取网页内容预览（Tavily → Firecrawl 自动降级）",
 		promptGuidelines: [
-			"Use web_fetch to get the full content of a specific webpage URL.",
-			"Use web_fetch after grok_search to read detailed content from search result URLs.",
+			"Use web_fetch to preview content from a specific webpage URL.",
+			"Use web_fetch after grok_search to inspect selected result URLs; increase max_output_bytes only when the user needs more detail.",
 		],
 		parameters: Type.Object({
 			url: Type.String({ description: "要抓取的网页 URL（HTTP/HTTPS）" }),
+			max_output_bytes: Type.Optional(
+				Type.Number({ description: "返回内容最大字节数，默认 12000", minimum: 3000, maximum: 51200 }),
+			),
 		}),
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const config = await configManager.getFullConfig();
+			const maxOutputBytes = clampNumber(params.max_output_bytes, 12000, 3000, 50 * 1024);
 			const endStatus = beginStatus(ctx, formatGrokStatus(config.grokModel));
 			onUpdate?.({ content: [{ type: "text", text: "📄 正在抓取网页..." }], details: {} });
 
@@ -1800,7 +1938,7 @@ export default function (pi: ExtensionAPI) {
 				if (config.tavilyApiKey) {
 					const result = await tavilyExtract(params.url, signal);
 					if (result) {
-						const output = await truncateToolOutput(result, "web-fetch-tavily");
+						const output = await truncateToolOutput(result, "web-fetch-tavily", { maxBytes: maxOutputBytes });
 						const { content, ...outputDetails } = output;
 						return {
 							content: [{ type: "text", text: content }],
@@ -1819,7 +1957,7 @@ export default function (pi: ExtensionAPI) {
 					});
 					const result = await firecrawlScrape(params.url, signal);
 					if (result) {
-						const output = await truncateToolOutput(result, "web-fetch-firecrawl");
+						const output = await truncateToolOutput(result, "web-fetch-firecrawl", { maxBytes: maxOutputBytes });
 						const { content, ...outputDetails } = output;
 						return {
 							content: [{ type: "text", text: content }],
@@ -1883,13 +2021,16 @@ export default function (pi: ExtensionAPI) {
 				Type.Number({ description: "最大遍历深度（1-5），默认 1", minimum: 1, maximum: 5 }),
 			),
 			max_breadth: Type.Optional(
-				Type.Number({ description: "每页最大跟踪链接数（1-500），默认 20", minimum: 1, maximum: 500 }),
+				Type.Number({ description: "每页最大跟踪链接数（1-500），默认 10", minimum: 1, maximum: 500 }),
 			),
 			limit: Type.Optional(
-				Type.Number({ description: "总链接处理上限（1-500），默认 50", minimum: 1, maximum: 500 }),
+				Type.Number({ description: "总链接处理上限（1-500），默认 30", minimum: 1, maximum: 500 }),
 			),
 			timeout: Type.Optional(
 				Type.Number({ description: "超时秒数（10-150），默认 150", minimum: 10, maximum: 150 }),
+			),
+			max_output_bytes: Type.Optional(
+				Type.Number({ description: "返回内容最大字节数，默认 12000", minimum: 3000, maximum: 51200 }),
 			),
 		}),
 
@@ -1903,14 +2044,18 @@ export default function (pi: ExtensionAPI) {
 						instructions: params.instructions,
 						maxDepth: params.max_depth,
 						maxBreadth: params.max_breadth,
-						limit: params.limit,
+						limit: params.limit ?? 30,
 						timeout: params.timeout,
 					},
 					signal,
 				);
+				const output = await truncateToolOutput(result, "web-map", {
+					maxBytes: clampNumber(params.max_output_bytes, 12000, 3000, 50 * 1024),
+				});
+				const { content, ...outputDetails } = output;
 				return {
-					content: [{ type: "text", text: result }],
-					details: { url: params.url },
+					content: [{ type: "text", text: content }],
+					details: { url: params.url, ...outputDetails },
 				};
 			} finally {
 				endStatus();
@@ -2383,25 +2528,36 @@ export default function (pi: ExtensionAPI) {
 			const endStatus = beginStatus(ctx, formatGrokStatus(config.grokModel));
 
 			try {
-				const raw = await grokSearch(args.trim());
+				const controls = resolveSearchControls({ mode: "compact" });
+				const raw = await grokSearch(args.trim(), "", undefined, "", controls);
 				const { answer, sources } = splitAnswerAndSources(raw);
+				const limitedAnswer = limitText(answer, controls.maxAnswerChars);
 
-				let output = answer;
+				let output = limitedAnswer.text;
+				if (limitedAnswer.truncated) {
+					output += `\n\n[Answer truncated to ${controls.maxAnswerChars} characters.]`;
+				}
 				if (sources.length > 0) {
 					const sessionId = newSessionId();
 					sourcesCache.set(sessionId, sources);
-					output += `\n\n---\n**信源 (${sources.length})** | session_id: \`${sessionId}\`\n`;
-					for (const s of sources.slice(0, 10)) {
+					const visibleSources = sources.slice(0, controls.maxSources);
+					output += `\n\n---\n**信源 (${visibleSources.length}/${sources.length})** | session_id: \`${sessionId}\`\n`;
+					for (const s of visibleSources) {
 						output += s.title ? `- [${s.title}](${s.url})\n` : `- ${s.url}\n`;
 					}
+					if (sources.length > visibleSources.length) {
+						output += `- ... 还有 ${sources.length - visibleSources.length} 个信源，使用 grok_sources 分页获取\n`;
+					}
 				}
+				if (!output.trim()) output = "未返回可显示内容。请尝试 normal/deep 模式或缩小查询。";
 
+				const rendered = await truncateToolOutput(output, "grok-search-command", { maxBytes: controls.maxOutputBytes });
 				pi.sendMessage(
 					{
 						customType: "grok-search",
-						content: output,
+						content: rendered.content,
 						display: true,
-						details: { sources },
+						details: { sources_count: sources.length },
 					},
 					{ triggerTurn: true },
 				);
@@ -2586,25 +2742,37 @@ export default function (pi: ExtensionAPI) {
 			const endStatus = beginStatus(ctx, formatGrokStatus(config.grokModel));
 
 			try {
+				const controls = resolveSearchControls({ mode: "compact", max_sources: 8 });
 				const raw = await grokSearch(
 					`site:github.com earendil-works pi coding agent extensions ${topic}`,
+					"",
+					undefined,
+					"",
+					controls,
 				);
 				const { answer, sources } = splitAnswerAndSources(raw);
+				const limitedAnswer = limitText(answer, controls.maxAnswerChars);
 
-				let output = `## pi Extension 文档搜索: ${topic}\n\n${answer}`;
+				let output = `## pi Extension 文档搜索: ${topic}\n\n${limitedAnswer.text}`;
+				if (limitedAnswer.truncated) {
+					output += `\n\n[Answer truncated to ${controls.maxAnswerChars} characters.]`;
+				}
 				if (sources.length > 0) {
-					output += "\n\n### 相关链接\n";
-					for (const s of sources.slice(0, 8)) {
+					const visibleSources = sources.slice(0, controls.maxSources);
+					output += `\n\n### 相关链接 (${visibleSources.length}/${sources.length})\n`;
+					for (const s of visibleSources) {
 						output += s.title ? `- [${s.title}](${s.url})\n` : `- ${s.url}\n`;
 					}
 				}
+				if (!output.trim()) output = "未返回可显示内容。请尝试缩小查询。";
 
+				const rendered = await truncateToolOutput(output, "pi-ext-docs", { maxBytes: controls.maxOutputBytes });
 				pi.sendMessage(
 					{
 						customType: "grok-search",
-						content: output,
+						content: rendered.content,
 						display: true,
-						details: { sources },
+						details: { sources_count: sources.length },
 					},
 					{ triggerTurn: true },
 				);
@@ -2622,21 +2790,9 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 	// Message Renderer
 	// =========================================================================
-	pi.registerMessageRenderer("grok-search", (message, options, theme) => {
-		const { expanded } = options;
-		const details = message.details as { sources?: Source[] } | undefined;
+	pi.registerMessageRenderer("grok-search", (message, _options, theme) => {
 		let text = theme.fg("accent", "🔍 Grok Search\n\n");
 		text += message.content;
-
-		if (expanded && details?.sources?.length) {
-			text += "\n\n" + theme.fg("muted", "─── 信源 ───\n");
-			for (const s of details.sources) {
-				const label = s.title || s.url;
-				const provider = s.provider ? ` [${s.provider}]` : "";
-				text += theme.fg("dim", `• ${label}${provider}\n`);
-			}
-		}
-
 		return new Text(text, 0, 0);
 	});
 

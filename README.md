@@ -21,9 +21,9 @@ pi ──Extension──► pi-grok-search
 
 ## 功能特性
 
-- **🔍 AI 深度搜索** — Grok 驱动，自动时间注入，支持平台聚焦
-- **📄 网页抓取** — Tavily Extract → Firecrawl Scrape 自动降级
-- **🗺️ 站点映射** — Tavily Map 遍历网站结构
+- **🔍 AI 深度搜索** — Grok 驱动，自动时间注入，支持平台聚焦，默认紧凑输出
+- **📄 网页抓取** — Tavily Extract → Firecrawl Scrape 自动降级，默认返回预览避免上下文爆炸
+- **🗺️ 站点映射** — Tavily Map 遍历网站结构，默认限制链接与输出大小
 - **📋 搜索规划** — 6 阶段结构化规划
 - **💾 信源缓存** — session_id 索引，按需获取
 - **🔄 智能重试** — Retry-After 头解析 + 指数退避
@@ -116,14 +116,35 @@ export FIRECRAWL_API_KEY="fc-your-key"
 
 | 工具              | 说明                                        |
 | ----------------- | ------------------------------------------- |
-| `grok_search`     | AI 深度搜索，返回结果 + session_id          |
-| `grok_sources`    | 通过 session_id 获取信源列表                |
-| `web_fetch`       | 抓取网页内容（Tavily → Firecrawl 自动降级） |
-| `web_map`         | 遍历网站结构，生成站点地图                  |
+| `grok_search`     | AI 深度搜索，默认 compact 输出，返回结果 + session_id |
+| `grok_sources`    | 通过 session_id 分页获取信源列表                    |
+| `web_fetch`       | 抓取网页内容预览（Tavily → Firecrawl 自动降级）      |
+| `web_map`         | 遍历网站结构，生成受限站点地图                      |
 | `grok_config`     | 查看/修改/测试配置                          |
 | `search_planning` | 6 阶段结构化搜索规划                        |
 
 安装后 LLM 会自动识别这些工具，根据用户问题自主决定调用。
+
+### 搜索结果控制
+
+为避免一次搜索把上下文撑爆，默认启用保守预算：
+
+- `grok_search` 默认 `mode=compact`，只返回紧凑答案和 Top 信源；明确需要深度研究时再用 `mode=deep`
+- `extra_sources` 是 Tavily/Firecrawl 共享的补充信源总预算，不会再被两个引擎叠加放大
+- `grok_sources` 支持 `limit` / `offset` 分页，默认每次 20 条
+- `web_fetch` 默认最多返回约 12KB 预览，可用 `max_output_bytes` 临时放大
+- `web_map` 默认 `max_breadth=10`、`limit=30`，并走统一输出截断
+
+常用参数：
+
+```json
+{
+  "mode": "compact | normal | deep | sources_only",
+  "max_answer_chars": 6000,
+  "max_sources": 8,
+  "max_output_bytes": 12000
+}
+```
 
 ## 信源质量准则
 
