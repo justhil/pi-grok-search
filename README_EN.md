@@ -22,6 +22,7 @@ pi ──Extension──► pi-grok-search
 ## Features
 
 - **🔍 AI Deep Search** — Grok-powered, auto time injection, platform focus, compact output by default
+- **🎛️ Search profiles** — Switch Auto / Coding Docs / Code Examples / Project Research / Academic / Fact Check in `/grok-config`
 - **📄 Web Fetch** — Tavily Extract → Firecrawl Scrape auto-fallback, preview output by default
 - **🗺️ Site Mapping** — Tavily Map traverses website structure with conservative defaults
 - **📋 Search Planning** — 6-phase structured planning
@@ -85,7 +86,7 @@ In pi, type:
 /grok-config
 ```
 
-Supports: view config, set Grok/Tavily/Firecrawl API, switch model, test connections.
+Supports: view config, set Grok/Tavily/Firecrawl API, switch model, switch search profile, test connections.
 
 ### Config File
 
@@ -96,6 +97,7 @@ Persisted to `~/.config/pi-grok-search/config.json`:
   "apiUrl": "https://api.x.ai/v1",
   "apiKey": "xai-your-key",
   "model": "grok-4-fast",
+  "searchProfile": "auto",
   "tavilyApiKey": "tvly-your-key",
   "firecrawlApiKey": "fc-your-key"
 }
@@ -125,6 +127,21 @@ Persisted to `~/.config/pi-grok-search/config.json`:
 
 After installation, LLM automatically recognizes these tools and decides when to call them.
 
+### Search Profiles
+
+`/grok-config` switches the global default search profile persisted in `~/.config/pi-grok-search/config.json`. `grok_search` also accepts a `profile` parameter for per-call overrides.
+
+| Profile | `profile` | Best for |
+| ------- | --------- | -------- |
+| Auto | `auto` | Default strategy, infer from the query |
+| Coding Docs | `coding_docs` | Official docs, APIs, versions, minimal examples |
+| Code Examples | `code_examples` | GitHub examples and real project usage |
+| Project Research | `project_research` | README, issues, releases, changelog, project comparisons |
+| Academic | `academic` | Papers, reports, DOI, author/year metadata, evidence chains |
+| Fact Check | `fact_check` | Multi-source verification, conflicting evidence, confidence |
+
+The main pi prompt only receives a lightweight hint for the active profile. Full profile prompts are injected only into Grok API requests to reduce persistent context usage.
+
 ### Search Result Controls
 
 To avoid context blow-ups, conservative budgets are enabled by default:
@@ -139,6 +156,7 @@ Common parameters:
 
 ```json
 {
+  "profile": "auto | coding_docs | code_examples | project_research | academic | fact_check",
   "mode": "compact | normal | deep | sources_only",
   "max_answer_chars": 6000,
   "max_sources": 8,
@@ -148,13 +166,12 @@ Common parameters:
 
 ## Search Quality Guidelines
 
-Built-in behavioral guidelines (injected into system prompt via `promptGuidelines`):
+The extension keeps only lightweight search rules in the main pi prompt. Detailed rules are injected into Grok requests by search profile:
 
-- Search queries in English, user output in Chinese
-- Must verify with search even if internal knowledge exists
-- Key claims require ≥2 independent sources
-- Conflicting sources: present evidence from both sides
-- State limitations when uncertain
+- Coding profiles prefer official docs, versioned API references, GitHub source, and examples
+- Academic mode prioritizes papers, academic databases, official reports, and citeable metadata
+- Fact-check mode emphasizes independent sources, freshness, conflicting evidence, and confidence
+- Long pages are not injected by default; prefer compact results, source lists, and targeted fetches
 
 ## Links
 

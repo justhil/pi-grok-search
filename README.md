@@ -22,6 +22,7 @@ pi ──Extension──► pi-grok-search
 ## 功能特性
 
 - **🔍 AI 深度搜索** — Grok 驱动，自动时间注入，支持平台聚焦，默认紧凑输出
+- **🎛️ 搜索模式预设** — `/grok-config` 中切换 Auto / 编程文档 / 代码示例 / 项目调研 / 论文资料 / 事实核查
 - **📄 网页抓取** — Tavily Extract → Firecrawl Scrape 自动降级，默认返回预览避免上下文爆炸
 - **🗺️ 站点映射** — Tavily Map 遍历网站结构，默认限制链接与输出大小
 - **📋 搜索规划** — 6 阶段结构化规划
@@ -85,7 +86,7 @@ export FIRECRAWL_API_KEY="fc-your-key"
 /grok-config
 ```
 
-支持：查看配置、设置 Grok/Tavily/Firecrawl API、切换模型、测试连接。
+支持：查看配置、设置 Grok/Tavily/Firecrawl API、切换模型、切换搜索模式、测试连接。
 
 ### 配置文件
 
@@ -96,6 +97,7 @@ export FIRECRAWL_API_KEY="fc-your-key"
   "apiUrl": "https://api.x.ai/v1",
   "apiKey": "xai-your-key",
   "model": "grok-4-fast",
+  "searchProfile": "auto",
   "tavilyApiKey": "tvly-your-key",
   "firecrawlApiKey": "fc-your-key"
 }
@@ -125,6 +127,21 @@ export FIRECRAWL_API_KEY="fc-your-key"
 
 安装后 LLM 会自动识别这些工具，根据用户问题自主决定调用。
 
+### 搜索模式预设
+
+`/grok-config` 可切换全局默认搜索模式，保存到 `~/.config/pi-grok-search/config.json`。`grok_search` 也支持通过 `profile` 参数临时覆盖。
+
+| 模式 | `profile` | 适合场景 |
+| ---- | --------- | -------- |
+| 自动 | `auto` | 默认策略，按问题自动判断 |
+| 编程文档 | `coding_docs` | 官方文档、API、版本、最小示例 |
+| 代码示例 | `code_examples` | GitHub 参考代码、真实项目用法 |
+| 项目调研 | `project_research` | README、issue、release、changelog、项目比较 |
+| 论文资料 | `academic` | 论文、报告、DOI、作者年份、证据链 |
+| 事实核查 | `fact_check` | 多来源验证、冲突证据、可信度判断 |
+
+主模型只注入当前模式的轻量提示；完整模式提示词只在调用 Grok API 时注入，降低常驻上下文占用。
+
 ### 搜索结果控制
 
 为避免一次搜索把上下文撑爆，默认启用保守预算：
@@ -139,6 +156,7 @@ export FIRECRAWL_API_KEY="fc-your-key"
 
 ```json
 {
+  "profile": "auto | coding_docs | code_examples | project_research | academic | fact_check",
   "mode": "compact | normal | deep | sources_only",
   "max_answer_chars": 6000,
   "max_sources": 8,
@@ -148,13 +166,12 @@ export FIRECRAWL_API_KEY="fc-your-key"
 
 ## 信源质量准则
 
-本扩展内置了严格的搜索行为规范（通过 `promptGuidelines` 注入系统提示）：
+本扩展只在 pi 主提示中保留轻量搜索规则，详细准则按搜索模式注入 Grok 请求：
 
-- 搜索用英文，输出用中文
-- 即使有内部知识也必须搜索验证
-- 关键事实需 ≥2 个独立来源支持
-- 冲突来源需呈现双方证据
-- 不确定时先说明局限性
+- 编程场景优先官方文档、版本化 API、GitHub 源码和示例
+- 论文资料模式优先论文、学术数据库、官方报告和可引用元数据
+- 事实核查模式强调独立来源、时效性、冲突证据和置信度
+- 默认避免把长网页直接注入上下文，优先使用紧凑结果、信源列表和按需抓取
 
 ## 相关链接
 

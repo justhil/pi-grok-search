@@ -31,10 +31,22 @@ import { dirname, isAbsolute, join } from "node:path";
 // Types
 // =============================================================================
 
+const SEARCH_PROFILE_VALUES = [
+	"auto",
+	"coding_docs",
+	"code_examples",
+	"project_research",
+	"academic",
+	"fact_check",
+] as const;
+
+type SearchProfile = (typeof SEARCH_PROFILE_VALUES)[number];
+
 interface GrokConfigFile {
 	apiUrl?: string;
 	apiKey?: string;
 	model?: string;
+	searchProfile?: SearchProfile;
 	tavilyApiKey?: string;
 	tavilyApiUrl?: string;
 	firecrawlApiKey?: string;
@@ -316,6 +328,7 @@ class ConfigManager {
 		grokApiUrl: string;
 		grokApiKey: string;
 		grokModel: string;
+		searchProfile: SearchProfile;
 		tavilyApiUrl: string;
 		tavilyApiKey: string;
 		firecrawlApiUrl: string;
@@ -329,6 +342,9 @@ class ConfigManager {
 			grokModel: normalizeGrokModel(
 				process.env.GROK_MODEL || file.model || "grok-4-fast",
 				grokApiUrl,
+			),
+			searchProfile: normalizeSearchProfile(
+				process.env.GROK_SEARCH_PROFILE || file.searchProfile,
 			),
 			tavilyApiUrl:
 				process.env.TAVILY_API_URL ||
@@ -347,6 +363,12 @@ class ConfigManager {
 	async setModel(model: string): Promise<void> {
 		const file = await this.loadFile();
 		file.model = model;
+		await this.saveFile(file);
+	}
+
+	async setSearchProfile(profile: SearchProfile): Promise<void> {
+		const file = await this.loadFile();
+		file.searchProfile = profile;
 		await this.saveFile(file);
 	}
 
@@ -443,6 +465,238 @@ const SEARCH_MODE_DEFAULTS: Record<SearchMode, Omit<SearchControls, "mode">> = {
 	deep: { maxAnswerChars: 24000, maxSources: 20, maxOutputBytes: 32 * 1024 },
 	sources_only: { maxAnswerChars: 0, maxSources: 20, maxOutputBytes: 10 * 1024 },
 };
+
+type SearchDefaults = Omit<SearchControls, "mode">;
+
+interface SearchProfileDefinition {
+	label: string;
+	description: string;
+	lightPrompt: string;
+	searchPrompt: string;
+	defaults: Record<SearchMode, SearchDefaults>;
+}
+
+const SEARCH_PROFILE_DEFS: Record<SearchProfile, SearchProfileDefinition> = {
+	auto: {
+		label: "自动",
+		description: "根据问题自动选择搜索策略",
+		lightPrompt:
+			"Current grok_search profile: auto. Let grok_search infer the source strategy, keep results compact, and avoid long page fetches unless needed.",
+		searchPrompt: `# Search Profile: Auto
+
+Infer the best search strategy from the query.
+If it is about programming, prefer official docs and GitHub.
+If it is about academic or research material, prioritize papers, reports, and multi-source evidence.
+If it is about factual claims, verify with independent sources.
+Keep the result compact unless the query explicitly asks for depth.`,
+		defaults: SEARCH_MODE_DEFAULTS,
+	},
+	coding_docs: {
+		label: "编程文档",
+		description: "官方文档、API、版本、最小示例",
+		lightPrompt:
+			"Current grok_search profile: coding_docs. Prefer official docs, versioned API references, and compact source-first results.",
+		searchPrompt: `# Search Profile: Coding Docs
+
+Goal:
+Find precise technical documentation for programming tasks.
+
+Source priority:
+1. Official documentation
+2. Versioned API reference
+3. Official examples
+4. GitHub README, release notes, or changelog
+5. High-quality community articles only as fallback
+
+Output:
+- Direct answer first
+- API names, function signatures, config keys, and version notes when relevant
+- Minimal example if useful
+- Mention whether the source is official
+- Return only the most relevant links
+
+Avoid:
+- Long background explanations
+- Blog-first answers when official docs exist
+- Unverified snippets`,
+		defaults: {
+			compact: { maxAnswerChars: 3500, maxSources: 6, maxOutputBytes: 9000 },
+			normal: { maxAnswerChars: 7000, maxSources: 10, maxOutputBytes: 14 * 1024 },
+			deep: { maxAnswerChars: 14000, maxSources: 16, maxOutputBytes: 24 * 1024 },
+			sources_only: { maxAnswerChars: 0, maxSources: 10, maxOutputBytes: 9000 },
+		},
+	},
+	code_examples: {
+		label: "代码示例",
+		description: "GitHub 参考代码、真实项目用法",
+		lightPrompt:
+			"Current grok_search profile: code_examples. Prefer official examples and real repository file links; avoid large code dumps.",
+		searchPrompt: `# Search Profile: Code Examples
+
+Goal:
+Find real-world code examples or official sample implementations.
+
+Source priority:
+1. Official example repositories
+2. Framework or library GitHub repos
+3. Well-known open-source projects
+4. Gists or blogs only as fallback
+
+Output:
+- Repository name
+- File path or direct URL when possible
+- Short reason why the example is relevant
+- Small snippet or usage summary
+- License caution if the user may copy code
+
+Avoid:
+- Large code dumps
+- Toy examples unless official
+- Sources without clear file paths`,
+		defaults: {
+			compact: { maxAnswerChars: 4000, maxSources: 8, maxOutputBytes: 10000 },
+			normal: { maxAnswerChars: 8000, maxSources: 12, maxOutputBytes: 16 * 1024 },
+			deep: { maxAnswerChars: 16000, maxSources: 20, maxOutputBytes: 26 * 1024 },
+			sources_only: { maxAnswerChars: 0, maxSources: 12, maxOutputBytes: 10000 },
+		},
+	},
+	project_research: {
+		label: "项目调研",
+		description: "项目、工具、框架、README、issue、changelog",
+		lightPrompt:
+			"Current grok_search profile: project_research. Prefer official sites, README, changelog, release notes, and maintenance signals.",
+		searchPrompt: `# Search Profile: Project Research
+
+Goal:
+Research a project, library, framework, tool, or ecosystem.
+
+Source priority:
+1. Official website or docs
+2. GitHub README
+3. Release notes or changelog
+4. Issues or discussions
+5. Reputable comparisons or articles
+
+Output:
+- What it is
+- Current state and maintenance signal
+- Strengths and limitations
+- Relevant links
+- Mention stale or uncertain information
+
+Avoid:
+- Overclaiming popularity or stability without evidence`,
+		defaults: {
+			compact: { maxAnswerChars: 6000, maxSources: 10, maxOutputBytes: 12 * 1024 },
+			normal: { maxAnswerChars: 12000, maxSources: 16, maxOutputBytes: 20 * 1024 },
+			deep: { maxAnswerChars: 24000, maxSources: 24, maxOutputBytes: 32 * 1024 },
+			sources_only: { maxAnswerChars: 0, maxSources: 16, maxOutputBytes: 12 * 1024 },
+		},
+	},
+	academic: {
+		label: "论文资料",
+		description: "论文、报告、DOI、作者年份、证据链",
+		lightPrompt:
+			"Current grok_search profile: academic. Prefer citeable papers, reports, DOI/stable URLs, and multi-source evidence.",
+		searchPrompt: `# Search Profile: Academic Research
+
+Goal:
+Find accurate, citeable research material.
+
+Source priority:
+1. Peer-reviewed papers
+2. Academic databases
+3. Official reports or white papers
+4. Books or institutional publications
+5. Reputable secondary sources only as context
+
+Output:
+- Author, year, title, and venue if available
+- DOI or stable URL if available
+- Main claim, method, and evidence
+- Limitations
+- Conflicting findings if present
+- Separate confirmed facts from uncertain claims
+
+Avoid:
+- Single-source conclusions
+- Blog-style summaries as primary evidence
+- Missing citation metadata when available`,
+		defaults: {
+			compact: { maxAnswerChars: 12000, maxSources: 20, maxOutputBytes: 24 * 1024 },
+			normal: { maxAnswerChars: 18000, maxSources: 30, maxOutputBytes: 32 * 1024 },
+			deep: { maxAnswerChars: 32000, maxSources: 40, maxOutputBytes: 48 * 1024 },
+			sources_only: { maxAnswerChars: 0, maxSources: 30, maxOutputBytes: 18 * 1024 },
+		},
+	},
+	fact_check: {
+		label: "事实核查",
+		description: "多来源验证、冲突证据、可信度判断",
+		lightPrompt:
+			"Current grok_search profile: fact_check. Verify claims with independent timely sources and surface conflicts or uncertainty.",
+		searchPrompt: `# Search Profile: Fact Check
+
+Goal:
+Verify factual claims using independent and timely sources.
+
+Source priority:
+1. Primary sources
+2. Official announcements or public records
+3. Reputable media
+4. Independent expert analysis
+5. Wikipedia only as background, not primary proof
+
+Output:
+- Verdict first: likely true, likely false, mixed, or unresolved
+- Evidence for and against
+- Source freshness
+- Known uncertainty
+- Confidence level
+
+Avoid:
+- Treating repeated syndicated reports as independent sources
+- Hiding conflicting evidence`,
+		defaults: {
+			compact: { maxAnswerChars: 7000, maxSources: 12, maxOutputBytes: 16 * 1024 },
+			normal: { maxAnswerChars: 12000, maxSources: 18, maxOutputBytes: 24 * 1024 },
+			deep: { maxAnswerChars: 22000, maxSources: 28, maxOutputBytes: 36 * 1024 },
+			sources_only: { maxAnswerChars: 0, maxSources: 18, maxOutputBytes: 14 * 1024 },
+		},
+	},
+};
+
+function parseSearchProfile(value: unknown): SearchProfile | null {
+	if (typeof value !== "string") return null;
+	const normalized = value.trim().toLowerCase().replace(/[\s-]+/g, "_");
+	return SEARCH_PROFILE_VALUES.includes(normalized as SearchProfile)
+		? (normalized as SearchProfile)
+		: null;
+}
+
+function normalizeSearchProfile(value: unknown): SearchProfile {
+	return parseSearchProfile(value) || "auto";
+}
+
+function formatSearchProfile(profile: SearchProfile): string {
+	const definition = SEARCH_PROFILE_DEFS[profile];
+	return `${definition.label} (${profile})`;
+}
+
+function searchProfileMenuItems(current: SearchProfile): string[] {
+	return SEARCH_PROFILE_VALUES.map((profile) => {
+		const definition = SEARCH_PROFILE_DEFS[profile];
+		const prefix = profile === current ? "✓ " : "  ";
+		return `${prefix}${definition.label} - ${definition.description}`;
+	});
+}
+
+function searchProfileFromMenuItem(item: string): SearchProfile | null {
+	const label = item.replace(/^\s*✓?\s*/, "").split(" - ")[0]?.trim();
+	for (const profile of SEARCH_PROFILE_VALUES) {
+		if (SEARCH_PROFILE_DEFS[profile].label === label) return profile;
+	}
+	return null;
+}
 
 function getDebugConfig(): { enabled: boolean; logDir: string; level: string } {
 	const enabled = ["true", "1", "yes", "on"].includes(
@@ -1127,11 +1381,14 @@ function clampNumber(value: number | undefined, fallback: number, min: number, m
 	return Math.min(Math.max(Math.floor(value), min), max);
 }
 
-function resolveSearchControls(input: SearchControlInput): SearchControls {
+function resolveSearchControls(
+	input: SearchControlInput,
+	profile: SearchProfile = "auto",
+): SearchControls {
 	const mode = SEARCH_MODE_VALUES.includes(input.mode as SearchMode)
 		? (input.mode as SearchMode)
 		: "compact";
-	const defaults = SEARCH_MODE_DEFAULTS[mode];
+	const defaults = SEARCH_PROFILE_DEFS[profile].defaults[mode];
 	return {
 		mode,
 		maxAnswerChars: clampNumber(input.max_answer_chars, defaults.maxAnswerChars, 0, 50000),
@@ -1210,6 +1467,7 @@ async function grokSearch(
 	signal?: AbortSignal,
 	modelOverride = "",
 	controls: SearchControls = resolveSearchControls({}),
+	profile: SearchProfile = "auto",
 ): Promise<string> {
 	const config = await configManager.getFullConfig();
 	if (!config.grokApiUrl || !config.grokApiKey) {
@@ -1224,13 +1482,14 @@ async function grokSearch(
 	await debugLog("grok.search", {
 		model: effectiveModel,
 		platform,
+		profile,
 		hasTimeContext: !!timeContext,
 	});
 
 	const payload = {
 		model: effectiveModel,
 		messages: [
-			{ role: "system", content: buildSearchPrompt(controls) },
+			{ role: "system", content: buildSearchPrompt(profile, controls) },
 			{ role: "user", content: timeContext + query + platformPrompt },
 		],
 		stream: true,
@@ -1568,6 +1827,7 @@ const grokConfigParameters = Type.Object({
 			"grokApiUrl",
 			"grokApiKey",
 			"model",
+			"searchProfile",
 			"tavilyApiKey",
 			"tavilyApiUrl",
 			"firecrawlApiKey",
@@ -1593,7 +1853,7 @@ const SEARCH_PROMPT_BASE = `# Core Instruction
 4. State limitations when evidence is incomplete or conflicting.
 `;
 
-function buildSearchPrompt(controls: SearchControls): string {
+function buildSearchPrompt(profile: SearchProfile, controls: SearchControls): string {
 	const sourceLimit = controls.maxSources > 0
 		? `Return at most ${controls.maxSources} source links in the final source/reference block.`
 		: "Do not include a final source/reference block.";
@@ -1611,7 +1871,7 @@ function buildSearchPrompt(controls: SearchControls): string {
 			"Mode: sources_only. Do not synthesize a long answer. Return the most relevant sources with one-line relevance notes.",
 	};
 
-	return `${SEARCH_PROMPT_BASE}\n# Search Budget\n\n${modeInstruction[controls.mode]}\n${answerLimit}\n${sourceLimit}\n`;
+	return `${SEARCH_PROMPT_BASE}\n${SEARCH_PROFILE_DEFS[profile].searchPrompt}\n\n# Search Budget\n\n${modeInstruction[controls.mode]}\n${answerLimit}\n${sourceLimit}\n`;
 }
 
 // =============================================================================
@@ -1622,6 +1882,13 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 	// Tool: grok_search — AI 网络搜索
 	// =========================================================================
+	pi.on("before_agent_start", async (_event, _ctx) => {
+		const config = await configManager.getFullConfig();
+		return {
+			systemPrompt: `${_event.systemPrompt}\n\n${SEARCH_PROFILE_DEFS[config.searchProfile].lightPrompt}`,
+		};
+	});
+
 	pi.registerTool({
 		name: "grok_search",
 		label: "Grok Search",
@@ -1632,27 +1899,11 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet:
 			"通过 Grok API 执行 AI 深度网络搜索（文档、API、开源项目等）",
 		promptGuidelines: [
-			// === Search Trigger Conditions ===
-			"Use grok_search when the user asks to search the web, find documentation, or look up technical information.",
-			"Use grok_search to find pi Extension development docs, API references, and best practices.",
-			"Strictly distinguish internal vs external knowledge. Even if you possess common-sense knowledge about a topic (e.g., a library like FastAPI), you MUST still use grok_search to verify with latest search results or official documentation.",
-			"When uncertain about facts, explicitly inform the user of limitations rather than speculating from internal knowledge.",
-			// === Search Execution ===
-			"Search queries to grok_search MUST be in English for maximum coverage. Final user-facing output MUST be in Chinese.",
-			"Execute independent grok_search calls in PARALLEL. Sequential execution only when one search depends on another's results.",
-			"Prioritize authoritative sources: official docs, Wikipedia, academic databases, GitHub repos, reputable media.",
-			// === Source Quality ===
-			"Key factual claims MUST be supported by ≥2 independent sources. Single-source claims: explicitly state this limitation.",
-			"Conflicting sources: Present evidence from both sides, assess credibility/timeliness, identify stronger evidence, or declare unresolved discrepancies.",
-			"Empirical conclusions MUST include confidence levels (High/Medium/Low).",
-			// === Post-Search Behavior ===
-			"Use compact grok_search by default; only use mode=deep when the user explicitly asks for deep research or exhaustive analysis.",
-			"After grok_search, call grok_sources with the returned session_id to retrieve paged source URLs if needed.",
-			"After grok_search returns results, use web_fetch to preview selected URLs; only raise max_output_bytes when more detail is necessary.",
-			// === Output Standards ===
-			"All conclusions MUST specify: applicable conditions, scope boundaries, and known limitations.",
-			"When uncertain: state unknowns and reasons BEFORE presenting confirmed facts.",
-			"Challenge flawed premises: when user logic contains errors, pinpoint specific issues with evidence.",
+			"Use grok_search when external, recent, or authoritative web information is needed.",
+			"Search queries to grok_search should be in English when possible; answer the user in Chinese unless requested otherwise.",
+			"Prefer the active grok_search profile; pass profile explicitly only when the user asks for a different search style.",
+			"For programming tasks, prefer official docs and GitHub sources; use web_fetch only for selected high-value pages.",
+			"Avoid injecting long web pages into context; prefer compact results, source lists, and targeted fetches.",
 		],
 		parameters: Type.Object({
 			query: Type.String({
@@ -1670,6 +1921,12 @@ export default function (pi: ExtensionAPI) {
 						"额外补充信源总预算（Tavily/Firecrawl 共享），0 为关闭。默认 0。",
 					minimum: 0,
 					maximum: 50,
+				}),
+			),
+			profile: Type.Optional(
+				StringEnum(SEARCH_PROFILE_VALUES, {
+					description:
+						"搜索场景预设。默认使用 /grok-config 中保存的全局模式。",
 				}),
 			),
 			mode: Type.Optional(
@@ -1708,7 +1965,8 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const config = await configManager.getFullConfig();
 			const effectiveModel = normalizeGrokModel(params.model || config.grokModel, config.grokApiUrl);
-			const controls = resolveSearchControls(params);
+			const profile = parseSearchProfile(params.profile) || config.searchProfile;
+			const controls = resolveSearchControls(params, profile);
 			const endStatus = beginStatus(ctx, formatGrokStatus(effectiveModel));
 			onUpdate?.({ content: [{ type: "text", text: "🔍 正在搜索..." }], details: {} });
 
@@ -1732,7 +1990,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				const tasks: Promise<unknown>[] = [
-					grokSearch(params.query, params.platform || "", signal, effectiveModel, controls),
+					grokSearch(params.query, params.platform || "", signal, effectiveModel, controls, profile),
 				];
 
 				if (extraBudget.tavily > 0) {
@@ -1806,6 +2064,7 @@ export default function (pi: ExtensionAPI) {
 						sources_count: allSources.length,
 						returned_sources_count: visibleSources.length,
 						answer_chars: answer.length,
+						profile,
 						mode: controls.mode,
 						model: effectiveModel,
 						...outputDetails,
@@ -2085,6 +2344,7 @@ export default function (pi: ExtensionAPI) {
 					`| Grok API URL | ${config.grokApiUrl || "❌ 未配置"} |`,
 					`| Grok API Key | ${config.grokApiKey ? configManager.maskKey(config.grokApiKey) : "❌ 未配置"} |`,
 					`| Grok 模型 | ${config.grokModel} |`,
+					`| 搜索模式 | ${formatSearchProfile(config.searchProfile)} |`,
 					`| Tavily API URL | ${config.tavilyApiUrl} |`,
 					`| Tavily API Key | ${config.tavilyApiKey ? configManager.maskKey(config.tavilyApiKey) : "❌ 未配置"} |`,
 					`| Firecrawl API URL | ${config.firecrawlApiUrl} |`,
@@ -2183,6 +2443,14 @@ export default function (pi: ExtensionAPI) {
 					case "model":
 						await configManager.setModel(params.value);
 						break;
+					case "searchProfile": {
+						const profile = parseSearchProfile(params.value);
+						if (!profile) {
+							throw new Error(`无效搜索模式: ${params.value}`);
+						}
+						await configManager.setSearchProfile(profile);
+						break;
+					}
 					case "tavilyApiKey":
 						await configManager.setTavily(params.value);
 						break;
@@ -2528,8 +2796,8 @@ export default function (pi: ExtensionAPI) {
 			const endStatus = beginStatus(ctx, formatGrokStatus(config.grokModel));
 
 			try {
-				const controls = resolveSearchControls({ mode: "compact" });
-				const raw = await grokSearch(args.trim(), "", undefined, "", controls);
+				const controls = resolveSearchControls({ mode: "compact" }, config.searchProfile);
+				const raw = await grokSearch(args.trim(), "", undefined, "", controls, config.searchProfile);
 				const { answer, sources } = splitAnswerAndSources(raw);
 				const limitedAnswer = limitText(answer, controls.maxAnswerChars);
 
@@ -2557,7 +2825,7 @@ export default function (pi: ExtensionAPI) {
 						customType: "grok-search",
 						content: rendered.content,
 						display: true,
-						details: { sources_count: sources.length },
+						details: { sources_count: sources.length, profile: config.searchProfile },
 					},
 					{ triggerTurn: true },
 				);
@@ -2578,16 +2846,32 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("grok-config", {
 		description: "配置 Grok Search（Grok / Tavily / Firecrawl API）",
 		handler: async (_args, ctx) => {
+			const config = await configManager.getFullConfig();
 			const choice = await ctx.ui.select("Grok Search 配置:", [
 				"查看当前配置",
 				"设置 Grok API",
 				"设置 Tavily API",
 				"设置 Firecrawl API",
 				"切换模型",
+				`切换搜索模式 (${SEARCH_PROFILE_DEFS[config.searchProfile].label})`,
 				"测试所有连接",
 			]);
 
 			if (!choice) return;
+
+			if (choice.startsWith("切换搜索模式")) {
+				const config = await configManager.getFullConfig();
+				const selected = await ctx.ui.select(
+					"选择默认搜索模式:",
+					searchProfileMenuItems(config.searchProfile),
+				);
+				if (!selected) return;
+				const profile = searchProfileFromMenuItem(selected);
+				if (!profile) return;
+				await configManager.setSearchProfile(profile);
+				ctx.ui.notify(`✅ 搜索模式已切换: ${formatSearchProfile(profile)}`, "info");
+				return;
+			}
 
 			switch (choice) {
 				case "查看当前配置": {
@@ -2595,6 +2879,7 @@ export default function (pi: ExtensionAPI) {
 					const lines = [
 						`Grok: ${config.grokApiUrl || "未配置"} | ${config.grokApiKey ? configManager.maskKey(config.grokApiKey) : "未配置"}`,
 						`模型: ${config.grokModel}`,
+						`搜索模式: ${formatSearchProfile(config.searchProfile)}`,
 						`Tavily: ${config.tavilyApiKey ? configManager.maskKey(config.tavilyApiKey) : "未配置"}`,
 						`Firecrawl: ${config.firecrawlApiKey ? configManager.maskKey(config.firecrawlApiKey) : "未配置"}`,
 					];
@@ -2742,13 +3027,15 @@ export default function (pi: ExtensionAPI) {
 			const endStatus = beginStatus(ctx, formatGrokStatus(config.grokModel));
 
 			try {
-				const controls = resolveSearchControls({ mode: "compact", max_sources: 8 });
+				const profile: SearchProfile = "coding_docs";
+				const controls = resolveSearchControls({ mode: "compact", max_sources: 8 }, profile);
 				const raw = await grokSearch(
 					`site:github.com earendil-works pi coding agent extensions ${topic}`,
 					"",
 					undefined,
 					"",
 					controls,
+					profile,
 				);
 				const { answer, sources } = splitAnswerAndSources(raw);
 				const limitedAnswer = limitText(answer, controls.maxAnswerChars);
@@ -2772,7 +3059,7 @@ export default function (pi: ExtensionAPI) {
 						customType: "grok-search",
 						content: rendered.content,
 						display: true,
-						details: { sources_count: sources.length },
+						details: { sources_count: sources.length, profile },
 					},
 					{ triggerTurn: true },
 				);
